@@ -1,129 +1,131 @@
-# LicenKit Swift SDK API 规范与参考手册
+# LicenKit Swift SDK API Reference Manual
 
-本文档提供 **LicenKit Swift SDK** 的所有公开类、结构体、枚举与异步接口的详细签名与调用说明。
+**English** | [简体中文](zh-CN/API_REFERENCE.md)
+
+This document provides detailed signatures and descriptions for all public classes, structs, enums, and asynchronous APIs in the **LicenKit Swift SDK**.
 
 ---
 
-## 1. 核心门面：`LicenKit`
+## 1. Core Facade: `LicenKit`
 
-`LicenKit` 是宿主应用接入 SDK 的主入口，采用现代 Swift 并发与线程安全设计。
+`LicenKit` is the main entry point for host applications, designed around modern Swift concurrency and thread safety.
 
 ```swift
 public final class LicenKit: @unchecked Sendable
 ```
 
-### 1.1 静态配置与共享实例
+### 1.1 Configuration & Shared Singleton
 
 #### `configure(with configuration: LicenKitConfiguration)`
-初始化全局共享的 LicenKit 实例。
+Initializes the global shared LicenKit instance.
 
 ```swift
 public static func configure(with configuration: LicenKitConfiguration)
 ```
-- **参数**：
-  - `configuration`: 初始化配置对象。
-- **说明**：通常在应用入口或启动委托中调用一次。重复调用将使用新配置覆盖全局实例。
+- **Parameters**:
+  - `configuration`: Initialization configuration object.
+- **Description**: Typically called once during application startup or app delegate initialization. Calling this multiple times will overwrite the shared instance with the new configuration.
 
 #### `shared`
-获取已初始化的全局共享实例。
+Retrieves the initialized global shared instance.
 
 ```swift
 public static var shared: LicenKit { get }
 ```
-- **异常**：若在调用 `configure(with:)` 之前访问，将抛出断言或致命错误（`fatalError`）。
+- **Exceptions**: Accessing this before calling `configure(with:)` triggers a `fatalError`.
 
 ---
 
-### 1.2 核心操作接口
+### 1.2 Core Operations
 
 #### `verifyOffline() async throws -> LicenseStatus`
-纯本地、脱网执行 Ed25519 签名核验与硬件指纹比对，0 网络延迟。自动兼容正式版商业许可证与免费试用版 Token。
+Executes pure local, offline Ed25519 cryptographic signature verification and hardware fingerprint checking with 0 network latency. Automatically supports both commercial license tokens and free trial tokens.
 
 ```swift
 public func verifyOffline() async throws -> LicenseStatus
 ```
-- **返回值**：当前许可证状态枚举 `LicenseStatus`（如 `.valid`、`.trial`、`.inGracePeriod` 等）。
-- **可能抛出的错误**：
-  - `LicenKitError.unactivated`: 本地 Keychain 中无任何凭据。
-  - `LicenKitError.invalidToken(reason)`: 凭据格式损坏或反序列化失败。
-  - `LicenKitError.cryptoError(reason)`: Ed25519 验签失败（公钥不匹配或内容被篡改）。
+- **Returns**: Current license status enum `LicenseStatus` (e.g. `.valid`, `.trial`, `.inGracePeriod`, etc.).
+- **Potential Errors**:
+  - `LicenKitError.unactivated`: No credentials found in local Keychain.
+  - `LicenKitError.invalidToken(reason)`: Malformed token format or deserialization failure.
+  - `LicenKitError.cryptoError(reason)`: Ed25519 signature verification failed (tampered token or incorrect public key).
 
 ---
 
 #### `requestTrial() async throws -> TrialResult`
-向服务端申请单机免密免费试用，自动验签 `LK-TRIAL` 离线 Token 并安全保存至本地 Keychain。
+Requests a silent, hardware-bound free trial from the LicenKit server, automatically verifies the `LK-TRIAL` offline token, and securely persists it into the Keychain.
 
 ```swift
 public func requestTrial() async throws -> TrialResult
 ```
-- **返回值**：`TrialResult`，包含试用认领结果、是否已认领过、过期时间及可用特性清单。
-- **可能抛出的错误**：
-  - `LicenKitError.apiError(code, message)`: 产品未开启试用（如 `TRIAL_NOT_AVAILABLE`）或服务异常。
-  - `LicenKitError.networkError(message)`: 网络连接失败。
+- **Returns**: `TrialResult`, containing trial claim status, whether previously claimed, expiration date, and enabled features.
+- **Potential Errors**:
+  - `LicenKitError.apiError(code, message)`: Free trial is disabled for this product (`TRIAL_NOT_AVAILABLE`) or server error.
+  - `LicenKitError.networkError(message)`: Network connection failure.
 
 ---
 
 #### `activate(licenseKey: String, machineName: String? = nil) async throws -> ActivationResult`
-向 LicenKit 边缘引擎在线激活当前设备席位，并持久化新凭据至 Keychain。
+Activates the current machine seat online against the LicenKit edge engine and persists updated credentials into Keychain.
 
 ```swift
 public func activate(licenseKey: String, machineName: String? = nil) async throws -> ActivationResult
 ```
-- **参数**：
-  - `licenseKey`: 用户输入的许可证密钥（格式：`LIC-XXXX-XXXX-XXXX-XXXX`）。
-  - `machineName`: 可选，自定义设备别名（默认读取系统设备名）。
-- **返回值**：`ActivationResult`，包含席位 ID、签名 Token、策略信息。
-- **可能抛出的错误**：
-  - `LicenKitError.apiError(code, message)`: 许可证无效、过期或已被禁用。
-  - `LicenKitError.maxMachinesReached`: 授权席位已满。
-  - `LicenKitError.networkError(message)`: 网络连接失败。
+- **Parameters**:
+  - `licenseKey`: The customer's license key string (`LIC-XXXX-XXXX-XXXX-XXXX`).
+  - `machineName`: Optional custom machine alias (defaults to host name).
+- **Returns**: `ActivationResult`, containing machine seat ID, signed token, and policy details.
+- **Potential Errors**:
+  - `LicenKitError.apiError(code, message)`: Invalid, expired, or disabled license key.
+  - `LicenKitError.maxMachinesReached`: All allowed seats for this license are occupied.
+  - `LicenKitError.networkError(message)`: Network connection failure.
 
 ---
 
 #### `validate() async throws -> ValidationResult`
-在线向服务端发送探活心跳，同步最新许可证状态并自动续期本地 Token。
+Sends an online heartbeat probe to the server, synchronizes latest status, and renews the local token if updated.
 
 ```swift
 public func validate() async throws -> ValidationResult
 ```
-- **返回值**：`ValidationResult`，包含探活结论、最新 Token 与过期时间。
-- **说明**：建议在后台静默发起（例如在宽限期内或每日首次联网时）。若网络超时失败，SDK 不会自动使凭据失效，应用可根据 `verifyOffline()` 宽限期策略决定是否继续放行。
+- **Returns**: `ValidationResult`, containing probe validation status, refreshed token, and expiration dates.
+- **Description**: Best executed silently in the background (e.g. during grace periods or daily network access). If network times out, credentials remain valid within the offline grace period.
 
 ---
 
 #### `deactivate() async throws`
-向服务端释放当前设备绑定的席位，并原子清空本地 Keychain 中的授权凭据。
+Releases the current machine seat on the server and clears credentials from the local Keychain.
 
 ```swift
 public func deactivate() async throws
 ```
-- **说明**：通常在用户主动退出授权、换机迁移或注销账号时调用。执行完成后，再次调用 `verifyOffline()` 将返回 `unactivated`。
+- **Description**: Typically invoked when the user unlinks the device or logs out. After deactivation, subsequent `verifyOffline()` calls will throw `.unactivated`.
 
 ---
 
 #### `hasFeature(_ featureKey: String) -> Bool`
-内存级极速判断当前许可证是否被授予指定的高级特性（Feature Entitlement）。
+In-memory fast lookup to check if a specific feature entitlement is granted under the active license or trial.
 
 ```swift
 public func hasFeature(_ featureKey: String) -> Bool
 ```
-- **参数**：
-  - `featureKey`: 特性标识字符串（例如 `"pro_export_4k"`, `"unlimited_tracks"`）。
-- **返回值**：`true` 表示具备该特性授权；`false` 表示无权使用或许可证无效。
+- **Parameters**:
+  - `featureKey`: Feature identifier string (e.g. `"pro_export_4k"`, `"unlimited_tracks"`).
+- **Returns**: `true` if authorized; `false` otherwise.
 
 ---
 
 #### `getMachineFingerprint() async throws -> String`
-直接获取当前设备的硬件指纹识别码。
+Extracts the immutable hardware fingerprint of the current machine.
 
 ```swift
 public func getMachineFingerprint() async throws -> String
 ```
-- **返回值**：设备硬件指纹字符串（macOS 环境下为 `IOPlatformUUID` 或安全回退哈希）。
+- **Returns**: Device fingerprint string (e.g. `IOPlatformUUID` on macOS or deterministic SHA-256 fallback hash).
 
 ---
 
-## 2. 配置结构：`LicenKitConfiguration`
+## 2. Configuration: `LicenKitConfiguration`
 
 ```swift
 public struct LicenKitConfiguration: Sendable {
@@ -143,129 +145,129 @@ public struct LicenKitConfiguration: Sendable {
 }
 ```
 
-- `serverUrl`: LicenKit 服务端部署地址（例如 `https://license.yourcompany.com`）。
-- `accountId`: 工作区/账户 ID（如 `acc_xxx`）。
-- `productId`: 软件产品 ID（如 `prd_mac_editor`）。
-- `publicKey`: 产品的 Ed25519 验签公钥（32 字节原始公钥的 Base64 字符串或标准 SPKI 文本）。
-- `timeoutInterval`: 网络请求超时时间（默认为 15 秒）。
+- `serverUrl`: Base endpoint of your LicenKit deployment (e.g. `https://license.yourcompany.com`).
+- `accountId`: Account / Workspace identifier (e.g. `acc_xxx`).
+- `productId`: Software product ID (e.g. `prd_mac_editor`).
+- `publicKey`: Product's Ed25519 public key (32-byte raw Base64 or standard SPKI PEM format).
+- `timeoutInterval`: Network request timeout in seconds (defaults to 15.0s).
 
 ---
 
-## 3. 核心数据模型
+## 3. Data Models
 
-### 3.1 许可证状态枚举：`LicenseStatus`
+### 3.1 License Status Enum: `LicenseStatus`
 
 ```swift
 public enum LicenseStatus: Equatable, Sendable {
-    /// 商业许可证完全有效
+    /// Commercial license is fully valid
     case valid(claims: LicenseClaims)
     
-    /// 免费试用期内有效
+    /// Free trial is active and within valid period
     case trial(claims: TrialClaims)
     
-    /// 脱网宽限期中（当前处于离线，但距上次校验仍在允许的宽限期内）
+    /// Currently in offline grace period (temporary offline buffer)
     case inGracePeriod(claims: LicenseClaims, remainingGraceSeconds: TimeInterval)
     
-    /// 许可证已过期
+    /// Commercial license has expired
     case expired(claims: LicenseClaims?)
     
-    /// 试用期已结束
+    /// Free trial period has ended
     case trialExpired(claims: TrialClaims?)
     
-    /// 凭据不可信（签名伪造、指纹不匹配等安全异常）
+    /// Credentials untrusted (signature tampered, fingerprint mismatch, or clock rollback)
     case untrusted(reason: String)
 }
 ```
 
-- `isUsable`: 判定当前状态是否允许应用核心功能放行运行（在 `.valid`、`.trial`、`.inGracePeriod` 时为 `true`）。
-- `isTrial`: 判定当前是否处于试用状态（`.trial` 或 `.trialExpired`）。
-- `features`: 统一获取当前授权或试用下发的功能特性数组 `[String]`。
+- `isUsable`: Convenience check whether the core app should remain usable (`true` for `.valid`, `.trial`, and `.inGracePeriod`).
+- `isTrial`: Whether currently under trial (`.trial` or `.trialExpired`).
+- `features`: Array of authorized feature keys `[String]`.
 
-### 3.2 离线荷载声明：`LicenseClaims` 与 `TrialClaims`
+### 3.2 Offline Claims: `LicenseClaims` & `TrialClaims`
 
-#### 商业许可证 Claims (`LicenseClaims`)
+#### Commercial License Claims (`LicenseClaims`)
 ```swift
 public struct LicenseClaims: Codable, Equatable, Sendable {
     public let typ: String              // "license"
-    public let licenseId: String         // 授权内部唯一标识
-    public let licenseKey: String        // 授权码 (sub)
-    public let accountId: String         // 账户 ID (acc)
-    public let productId: String         // 产品 ID (prd)
-    public let policyId: String          // 策略 ID (pol)
-    public let fingerprint: String       // 绑定的硬件指纹 (fp)
-    public let issuedAt: Date            // 签发时间 (iat)
-    public let expirationDate: Date      // 过期时间 (exp)
-    public let features: [String]        // 允许的功能特性列表 (fea)
+    public let licenseId: String         // Internal license ID
+    public let licenseKey: String        // License key code (sub)
+    public let accountId: String         // Account ID (acc)
+    public let productId: String         // Product ID (prd)
+    public let policyId: String          // Policy ID (pol)
+    public let fingerprint: String       // Hardware fingerprint (fp)
+    public let issuedAt: Date            // Token issuance date (iat)
+    public let expirationDate: Date      // Expiration date (exp)
+    public let features: [String]        // Enabled features list (fea)
 }
 ```
 
-#### 免费试用 Claims (`TrialClaims`)
+#### Free Trial Claims (`TrialClaims`)
 ```swift
 public struct TrialClaims: Codable, Equatable, Sendable {
     public let typ: String              // "trial"
-    public let accountId: String         // 账户 ID (acc)
-    public let productId: String         // 产品 ID (prd)
-    public let fingerprint: String       // 绑定的硬件指纹 (fp)
-    public let issuedAt: Date            // 试用启动时间
-    public let expirationDate: Date      // 试用到期时间
-    public let features: [String]        // 试用开放的功能特性列表 (fea)
+    public let accountId: String         // Account ID (acc)
+    public let productId: String         // Product ID (prd)
+    public let fingerprint: String       // Hardware fingerprint (fp)
+    public let issuedAt: Date            // Trial start date
+    public let expirationDate: Date      // Trial expiration date
+    public let features: [String]        // Trial features list (fea)
 }
 ```
 
-### 3.3 操作结果：`ActivationResult` 与 `TrialResult`
+### 3.3 Operation Results: `ActivationResult` & `TrialResult`
 
 ```swift
 public struct ActivationResult: Sendable {
     public let activated: Bool
-    public let reused: Bool              // 是否重用了历史激活席位
-    public let machineId: String         // 席位唯一标识
-    public let token: String             // 签名的离线 Token
-    public let tokenExpiresAt: Date?     // Token 本身有效期
-    public let licenseExpiresAt: Date?   // 商业授权到期时间
-    public let policy: ApiPolicyInfo     // 关联的策略信息
+    public let reused: Bool              // Whether existing seat was reused
+    public let machineId: String         // Seat identifier
+    public let token: String             // Signed offline token
+    public let tokenExpiresAt: Date?     // Token expiration date
+    public let licenseExpiresAt: Date?   // Commercial license expiration date
+    public let policy: ApiPolicyInfo     // Associated policy details
 }
 
 public struct TrialResult: Sendable {
-    public let trialClaimed: Bool        // 试用是否认领成功
-    public let alreadyClaimed: Bool      // 是否为历史已认领设备
-    public let expired: Bool             // 试用是否已过期
-    public let token: String?            // 离线试用 Token (已过期为 nil)
-    public let claimedAt: Date?          // 首次认领时间
-    public let expiresAt: Date?          // 试用到期时间
-    public let features: [String]        // 试用特性列表
+    public let trialClaimed: Bool        // Whether trial was claimed successfully
+    public let alreadyClaimed: Bool      // Whether previously claimed on this machine
+    public let expired: Bool             // Whether trial has already expired
+    public let token: String?            // Signed offline trial token
+    public let claimedAt: Date?          // Initial claim timestamp
+    public let expiresAt: Date?          // Trial expiration timestamp
+    public let features: [String]        // Available trial features
 }
 ```
 
 ---
 
-## 4. 错误处理体系：`LicenKitError`
+## 4. Error Handling: `LicenKitError`
 
-所有 SDK 抛出的异常均遵循标准 `LicenKitError`：
+All SDK exceptions conform to the standard `LicenKitError`:
 
 ```swift
 public enum LicenKitError: Error, LocalizedError, Equatable {
-    /// 本地无任何授权激活凭据
+    /// No local credentials stored on this device
     case unactivated
     
-    /// 席位已达到上限 (HTTP 409 / MAX_MACHINES_REACHED)
+    /// License seat limit reached (HTTP 409)
     case maxMachinesReached
     
-    /// 密码学校验失败（数字签名被篡改或公钥错误）
+    /// Cryptographic signature verification failed or public key malformed
     case cryptoError(String)
     
-    /// 凭据格式损坏或 Base64URL 无法反序列化
+    /// Token payload malformed or deserialization failure
     case invalidToken(String)
     
-    /// 硬件指纹不匹配（尝试将一台机器的凭据拷贝至另一台机器使用）
+    /// Hardware fingerprint mismatch (preventing multi-machine copying)
     case fingerprintMismatch(expected: String, actual: String)
     
-    /// 网络传输失败或超时
+    /// Network connection failure or timeout
     case networkError(String)
     
-    /// 服务端业务错误返回
+    /// Server business rejection
     case apiError(code: String, message: String)
     
-    /// 本地 Keychain 读写异常
+    /// System Keychain read/write error
     case keychainError(status: OSStatus, message: String)
 }
 ```

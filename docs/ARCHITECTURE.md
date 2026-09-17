@@ -1,60 +1,63 @@
-# LicenKit Swift SDK 架构设计与安全规范
+# LicenKit Swift SDK Architecture & Security Specification
 
-本文档详述 **LicenKit Swift SDK** (`licenkit-sdk-swift`) 的整体技术架构、安全设计、离线密码学校验以及平台适配机制。
+**English** | [简体中文](zh-CN/ARCHITECTURE.md)
 
----
-
-## 1. 架构愿景与设计原则
-
-LicenKit Swift SDK 专为商业级 macOS 软件及 Apple 生态应用打造，遵循以下核心设计原则：
-
-1. **零第三方外部依赖 (Zero External Dependencies)**：纯基于 Apple 官方系统库（`Foundation`、`CryptoKit`、`Security`、`IOKit`），确保无构建供应链隐患、零二进制体积负担、100% 满足 App Store 审核规范。
-2. **纯接口先行，无侵入无 UI 绑定 (Headless & UI-Agnostic)**：一期聚焦于纯接口层（Headless API），不捆绑任何 SwiftUI/AppKit 弹窗或视图逻辑，赋予宿主应用最大的自由度，便于集成到各类不同风格的 macOS 商业软件中。
-3. **双模校验与极致低延迟 (Dual-Mode Verification)**：
-   - **冷启动 0 毫秒感知**：本地利用 CryptoKit + Ed25519 离线数学验签快速进入主流程；
-   - **后台弹性心跳探活**：在宽限期内自动静默探活更新 License Token。
-4. **硬核硬件防扩散 (Hardware Anti-Abuse)**：基于操作系统内核层唯一硬件指纹，有效抵御跨机器拷贝、注册码多机共享等滥用场景。
-5. **为多端扩展预留架构 (Multi-Platform Preparedness)**：一期聚焦 macOS 桌面实现，同时在代码与协议设计上采用抽象隔离模式，确保未来无缝平滑扩展至 iOS、iPadOS。
+This document details the software architecture, security model, offline cryptography, and platform adaptation mechanisms of the **LicenKit Swift SDK** (`licenkit-sdk-swift`).
 
 ---
 
-## 2. 系统整体分层架构
+## 1. Architectural Vision & Principles
 
-SDK 内部按照高内聚、低耦合的分层架构组织：
+The LicenKit Swift SDK is engineered for commercial Apple platforms, adhering to these core principles:
+
+1. **Zero External Dependencies**: Built 100% on Apple system libraries (`Foundation`, `CryptoKit`, `Security`, `IOKit`). Eliminates supply chain risks, minimizes binary bloat, and guarantees full compliance with App Store guidelines.
+2. **Headless & UI-Agnostic**: Focused purely on business contracts and APIs, avoiding any tight coupling with UI frameworks (SwiftUI/AppKit), offering host applications complete aesthetic flexibility.
+3. **Dual-Mode Verification**:
+   - **0ms Cold-Start Check**: Offline Ed25519 signature and hardware fingerprint evaluation via CryptoKit with 0 network latency;
+   - **Resilient Background Heartbeats**: Silent, non-blocking online status refresh and token renewal during offline grace periods.
+4. **Seamless Free Trial**: Frictionless device-level trial claiming, issuance of offline `LK-TRIAL` tokens, and smooth upgrade transitions to commercial licenses upon purchase.
+5. **Kernel-Grade Hardware Anti-Abuse**: Leverages OS kernel-level hardware identifiers to prevent license key leaks, multi-machine cloning, and seat abuse.
+6. **Multi-Platform Preparedness**: First-phase targets macOS desktop, with modular abstractions that allow future expansion into iOS and iPadOS.
+
+---
+
+## 2. System Layering
+
+The SDK is organized into high-cohesion, low-coupling layers:
 
 ```mermaid
 flowchart TD
-    subgraph HostApp ["宿主应用程序 (Host macOS App)"]
-        AppDelegate["App 启动 / UI / 业务功能门禁"]
+    subgraph HostApp ["Host macOS Application"]
+        AppDelegate["App Lifecycle / UI / Feature Gate"]
     end
 
-    subgraph FacadeLayer ["1. 统一接口层 (Facade API)"]
+    subgraph FacadeLayer ["1. Facade API Layer"]
         LicenKit["LicenKit (Client Entrance)"]
         Config["LicenKitConfiguration"]
     end
 
-    subgraph CoreBusiness ["2. 业务门禁与状态机 (Core Engine)"]
-        StatusManager["LicenseStatusManager (有效 / 宽限期 / 过期 / 未激活)"]
-        Entitlements["FeatureEntitlementManager (功能特性校验)"]
+    subgraph CoreBusiness ["2. Core Licensing Engine"]
+        StatusManager["LicenseStatus (valid / trial / inGracePeriod / expired)"]
+        Entitlements["FeatureEntitlementManager (Feature Gate)"]
     end
 
-    subgraph SecurityCrypto ["3. 密码学与离线验签 (Crypto Core)"]
-        Ed25519Verifier["Ed25519Verifier (CryptoKit 原生离线验签)"]
-        ClaimsEvaluator["ClaimsEvaluator (Payload 逻辑核验)"]
+    subgraph SecurityCrypto ["3. Cryptography & Offline Verification"]
+        Ed25519Verifier["Ed25519Verifier (Native CryptoKit Verification)"]
+        ClaimsEvaluator["ClaimsEvaluator (Payload Validation)"]
     end
 
-    subgraph PlatformLayer ["4. 平台硬件与抽象 (Platform & Device)"]
-        ProviderProto["DeviceFingerprintProvider (协议)"]
-        MacProvider["MacOSFingerprintProvider (IOPlatformUUID + SHA256回退)"]
+    subgraph PlatformLayer ["4. Platform & Hardware Abstraction"]
+        ProviderProto["DeviceFingerprintProvider (Protocol)"]
+        MacProvider["MacOSFingerprintProvider (IOPlatformUUID + Fallback)"]
         IOSProvider["[Phase 2] IOSFingerprintProvider (IDFV / Keychain UUID)"]
     end
 
-    subgraph NetworkLayer ["5. 网络与边缘交互 (Network Layer)"]
+    subgraph NetworkLayer ["5. Network & Edge Interaction"]
         APIClient["LicenKitAPIClient (URLSession + async/await)"]
     end
 
-    subgraph StorageLayer ["6. 安全存储持久化 (Storage Layer)"]
-        KeychainStore["KeychainStore (macOS Keychain 原生加密隔离)"]
+    subgraph StorageLayer ["6. Storage & Security Layer"]
+        KeychainStore["KeychainStore (macOS Keychain Isolated Storage)"]
     end
 
     AppDelegate --> LicenKit
@@ -73,114 +76,130 @@ flowchart TD
 
 ---
 
-## 3. 核心机制设计
+## 3. Core Mechanisms
 
-### 3.1 双模校验模型 (Dual-Mode Verification)
+### 3.1 Dual-Mode Verification Workflow
 
-LicenKit 提供“**脱网离线数学验签**”与“**联网在线探活同步**”双重保障：
+LicenKit combines offline cryptographic checks with edge synchronization:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant App as 宿主应用 (App)
+    participant App as Host App
     participant SDK as LicenKit SDK
     participant KC as macOS Keychain
     participant Server as LicenKit Server (Edge)
 
-    Note over App, Server: 流程 A：应用启动（离线极速静默验签）
+    Note over App, Server: Flow A: Cold Launch (Instant Offline Verification)
     App->>SDK: verifyOffline()
-    SDK->>KC: 读取本地缓存的 License Token
-    alt 本地无凭据
+    SDK->>KC: Read cached token (License / Trial)
+    alt No credentials stored
         SDK-->>App: throw LicenKitError.unactivated
-    else 本地存在凭据
-        SDK->>SDK: Ed25519 签名验证 (CryptoKit)
-        SDK->>SDK: 硬件指纹提取与匹配
-        SDK->>SDK: 过期时间与宽限期判定
-        alt 凭据合法且未超期
-            SDK-->>App: return .valid(claims)
-        else 处于脱网宽限期
+    else Credentials present
+        SDK->>SDK: Verify Ed25519 signature (CryptoKit)
+        SDK->>SDK: Match hardware fingerprint
+        SDK->>SDK: Check expiration date & grace period
+        alt Valid & not expired
+            SDK-->>App: return .valid(claims) or .trial(claims)
+        else In offline grace period
             SDK-->>App: return .inGracePeriod(claims, remainingSec)
-            Note over SDK, Server: 后台异步静默探活 (不阻塞主线程)
+            Note over SDK, Server: Non-blocking silent background heartbeat
             SDK-)Server: apiValidate(licenseKey, fingerprint)
-            Server--)SDK: 返回最新续期 Token
-            SDK-)KC: 更新 Keychain 缓存
-        else 凭据过期或指纹不符
-            SDK-->>App: return .expired / .untrusted
+            Server--)SDK: Return refreshed token
+            SDK-)KC: Update Keychain cache
+        else Expired or fingerprint mismatch
+            SDK-->>App: return .expired / .trialExpired / .untrusted
         end
     end
 
-    Note over App, Server: 流程 B：用户输入激活码（在线激活）
+    Note over App, Server: Flow B: User enters license key (Online Activation)
     App->>SDK: activate(licenseKey: "LIC-XXXX-...")
-    SDK->>SDK: 提取本机唯一指纹 (IOPlatformUUID)
+    SDK->>SDK: Extract hardware fingerprint (IOPlatformUUID)
     SDK->>Server: POST /api/v1/client/activate
-    Server-->>SDK: 200 OK (下发签名 Token, 授权策略)
-    SDK->>SDK: 首次脱网验签完整性核验
-    SDK->>KC: 将 Token、Key、策略写入 Keychain
+    Server-->>SDK: 200 OK (Signed token & policy)
+    SDK->>SDK: Offline self-test verification
+    SDK->>KC: Persist token, key, and policy (overwriting trial)
     SDK-->>App: return ActivationResult(machineId, token, policy)
 ```
 
-### 3.2 离线 Token 密码学规范
+### 3.2 Offline Token Cryptography
 
-离线 Token 遵循轻量安全的 JWT-like 三段式 Base64URL 结构：
+Tokens follow a lightweight, standard three-part Base64URL structure:
 ```text
 Header.Payload.Signature
 ```
 
-1. **Header**：
+1. **Header**:
    ```json
    { "alg": "Ed25519", "typ": "LK-TOKEN", "kid": "key_prod_01" }
    ```
-2. **Payload (Claims)**：
-   ```json
-   {
-     "typ": "license",
-     "lic_id": "lic_99a8b7c6",
-     "sub": "LIC-ABCD-1234-EFGH-5678",
-     "acc": "acc_mixbayes_team",
-     "prd": "prd_mac_editor",
-     "pol": "pol_pro_lifetime",
-     "fp": "A3D16E04-209F-5BC7-99E3-4E80D6955E09",
-     "iat": 1726574400,
-     "exp": 1758110400,
-     "fea": ["4k_export", "gpu_acceleration", "batch_convert"]
-   }
-   ```
-3. **Signature**：
-   - 由服务端私钥对 `HeaderB64Url.PayloadB64Url` 执行 Ed25519 生成的 64 字节原生数字签名。
-   - SDK 本地利用 `CryptoKit.Curve25519.Signing.PublicKey` 原生验签，支持纯 Base64 或标准 SPKI 格式的 32 字节产品公钥。
+   (For trial tokens, `typ` is `"LK-TRIAL"`)
 
-### 3.3 macOS 硬件指纹提取机理与反滥用
+2. **Payload (Claims)**:
+   - Commercial License Claims:
+     ```json
+     {
+       "typ": "license",
+       "lic_id": "lic_99a8b7c6",
+       "sub": "LIC-ABCD-1234-EFGH-5678",
+       "acc": "acc_licenkit_team",
+       "prd": "prd_mac_editor",
+       "pol": "pol_pro_lifetime",
+       "fp": "A3D16E04-209F-5BC7-99E3-4E80D6955E09",
+       "iat": 1726574400,
+       "exp": 1758110400,
+       "fea": ["4k_export", "gpu_acceleration", "batch_convert"]
+     }
+     ```
+   - Free Trial Claims:
+     ```json
+     {
+       "typ": "trial",
+       "acc": "acc_licenkit_team",
+       "prd": "prd_mac_editor",
+       "fp": "A3D16E04-209F-5BC7-99E3-4E80D6955E09",
+       "iat": 1726574400,
+       "exp": 1727784000,
+       "fea": ["4k_export", "gpu_acceleration"]
+     }
+     ```
 
-硬件绑定的安全性直接决定了离线 License 是否能防止“一码多拷”：
-1. **优先路径 (Kernel IOKit 原生查询)**：
-   - 通过 CoreFoundation / IOKit C API 查询 `IOPlatformExpertDevice`；
-   - 提取系统全局唯一的 `kIOPlatformUUIDKey`（主板硬件 UUID）；
-   - **优势**：纯系统级 C API 极速调用，无需启动子进程，格式标准，系统升级与重装依然保持稳定。
-2. **安全降级回退 (Deterministic Fallback)**：
-   - 若处于极端环境或沙盒受限无法读取 `IOPlatformUUID`，自动枚举物理网络接口 MAC 地址与 Hostname；
-   - 经按序排序后计算 SHA-256 哈希作为稳定指纹，确保在任何环境下均能输出确定性、唯一的设备标识。
+3. **Signature**:
+   - 64-byte Ed25519 signature generated by the server's private key over `HeaderB64Url.PayloadB64Url`.
+   - Verified locally using `CryptoKit.Curve25519.Signing.PublicKey`.
 
-### 3.4 Keychain 安全凭据存储模型
+### 3.3 macOS Hardware Fingerprinting & Anti-Abuse
 
-- **拒绝明文文件**：坚决不在 `UserDefaults` 或 `~/Library/Application Support` 中以明文保存激活状态或解密密钥。
-- **macOS Keychain 隔离**：
-  - 基于 `kSecClassGenericPassword` 原生存储；
-  - `kSecAttrService` 绑定至 `com.licenkit.sdk.<productId>`，保证不同产品间的授权凭据安全隔离；
-  - `kSecAttrAccessible` 设置为 `kSecAttrAccessibleAfterFirstUnlock`，保证应用在开机后台静默运行时也能正常读取凭据。
+1. **Primary Path (Kernel IOKit Query)**:
+   - Queries `IOPlatformExpertDevice` via CoreFoundation / IOKit C APIs;
+   - Retrieves `kIOPlatformUUIDKey` (motherboard hardware UUID);
+   - Zero-overhead, no sub-process invocation, stable across OS updates.
+2. **Deterministic Fallback**:
+   - In sandboxed environments where `IOPlatformUUID` is restricted, enumerates physical network interface MAC addresses and hostname;
+   - Computes a deterministic SHA-256 hash as an immutable device fingerprint.
+
+### 3.4 Keychain Credential Storage
+
+- **No Plaintext Files**: Never saves activation keys or tokens in `UserDefaults` or plaintext plists.
+- **Keychain Isolation**:
+  - Based on `kSecClassGenericPassword`;
+  - Service scoped to `com.licenkit.client.<productId>`;
+  - Accessible attribute `kSecAttrAccessibleAfterFirstUnlock` for background Daemons;
+  - Supports iCloud Keychain roaming for seamless multi-device activation under the same Apple ID.
 
 ---
 
-## 4. 跨平台扩展性架构 (macOS -> iOS)
+## 4. Multi-Platform Extensibility (macOS -> iOS)
 
-虽然一期只交付 macOS 实现，但架构已完成跨平台解耦：
+The SDK architecture is designed for multi-platform readiness:
 
-1. **指纹提供器协议抽象**：
+1. **Protocol Abstraction**:
    ```swift
    public protocol DeviceFingerprintProvider: Sendable {
        func getFingerprint() async throws -> String
    }
    ```
-2. **编译期条件隔离 (Compile-time Platform Isolation)**：
-   - macOS 专有的 `import IOKit` 严格封闭在 `#if os(macOS)` 内；
-   - 二期扩展 iOS 时，只需补充实现 `#if os(iOS)` 的 `IOSFingerprintProvider`（基于 `UIDevice.current.identifierForVendor` + Keychain 设备标识）；
-   - 核心验签（CryptoKit）、状态机（LicenseStatus）、API 网络客户端（URLSession）等公共逻辑 100% 共享，实现无缝演进。
+2. **Compile-time Isolation**:
+   - macOS-specific `import IOKit` is contained strictly within `#if os(macOS)`;
+   - Future iOS extensions implement `IOSFingerprintProvider` using `UIDevice.current.identifierForVendor` and Keychain UUID;
+   - Crypto, models, network client, and licensing state machines are 100% platform-agnostic and shared across all targets.
