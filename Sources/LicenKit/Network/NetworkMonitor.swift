@@ -16,7 +16,7 @@ public protocol NetworkMonitorProtocol: Sendable {
 
 /// 基于 Apple 原生 Network.framework (NWPathMonitor) 的生产级网络监测实现
 public final class SystemNetworkMonitor: NetworkMonitorProtocol, @unchecked Sendable {
-    private let monitor: NWPathMonitor
+    private var monitor: NWPathMonitor?
     private let queue = DispatchQueue(label: "com.licenkit.networkmonitor", qos: .utility)
     private let lock = NSLock()
     
@@ -24,9 +24,7 @@ public final class SystemNetworkMonitor: NetworkMonitorProtocol, @unchecked Send
     private var statusChangeCallback: (@Sendable (Bool) -> Void)?
     private var isStarted = false
     
-    public init() {
-        self.monitor = NWPathMonitor()
-    }
+    public init() {}
     
     deinit {
         stop()
@@ -46,7 +44,8 @@ public final class SystemNetworkMonitor: NetworkMonitorProtocol, @unchecked Send
         self.isStarted = true
         self.statusChangeCallback = onStatusChange
         
-        monitor.pathUpdateHandler = { [weak self] path in
+        let newMonitor = NWPathMonitor()
+        newMonitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
             let currentlyOnline = (path.status == .satisfied)
             
@@ -61,7 +60,8 @@ public final class SystemNetworkMonitor: NetworkMonitorProtocol, @unchecked Send
             }
         }
         
-        monitor.start(queue: queue)
+        self.monitor = newMonitor
+        newMonitor.start(queue: queue)
     }
     
     public func stop() {
@@ -69,7 +69,8 @@ public final class SystemNetworkMonitor: NetworkMonitorProtocol, @unchecked Send
         defer { lock.unlock() }
         
         guard isStarted else { return }
-        monitor.cancel()
+        monitor?.cancel()
+        monitor = nil
         isStarted = false
         statusChangeCallback = nil
     }

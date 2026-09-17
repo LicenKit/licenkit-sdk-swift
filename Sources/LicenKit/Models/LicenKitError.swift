@@ -78,12 +78,14 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
                 "LICENSE_NOT_FOUND",
                 "LICENSE_REVOKED",
                 "LICENSE_SUSPENDED",
+                "LICENSE_NOT_ACTIVE",
                 "MACHINE_REVOKED",
                 "MACHINE_DEACTIVATED",
+                "MACHINE_NOT_ACTIVATED",
                 "MAX_MACHINES_REACHED",
-                "HTTP_404",
-                "HTTP_403",
-                "HTTP_422"
+                "SEAT_LIMIT_EXCEEDED",
+                "POLICY_DISABLED",
+                "POLICY_INACTIVE_OR_DISABLED"
             ]
             return rejections.contains(code)
         default:

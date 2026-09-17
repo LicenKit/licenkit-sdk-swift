@@ -215,6 +215,9 @@ public final class LicenKitRetryCoordinator: @unchecked Sendable {
             do {
                 return try await operation()
             } catch {
+                if let licenError = error as? LicenKitError, licenError.isRateLimited {
+                    markRateLimitedForToday()
+                }
                 // 第 2 次依然失败，标记本次 Session 彻底放弃不再尝试
                 setSessionBlocked(true)
                 throw error

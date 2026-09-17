@@ -151,11 +151,11 @@ final class ResilienceEvaluationTests: XCTestCase {
             apiClient: apiClient
         )
         
-        // 执行验证：服务端 500，应自动优雅降级，返回有效状态
+        // 执行验证：服务端 500，应自动静默保底 (Fail-Silent)，返回有效状态
         let result = try await licenKit.validate()
         XCTAssertTrue(result.valid)
         XCTAssertEqual(result.token, token)
-        XCTAssertTrue(result.reason?.contains("Validated offline") == true)
+        XCTAssertTrue(result.reason?.contains("Fail-silent") == true)
         
         // 验证内存缓存状态依然是有效
         guard case .valid = licenKit.cachedStatus else {
@@ -164,7 +164,7 @@ final class ResilienceEvaluationTests: XCTestCase {
         }
     }
     
-    func testValidateFailsOpenWhenServerReturns500AndGracePeriodExpiredWhileOnline() async throws {
+    func testValidateThrowsWhenStatusIsExpiredAndServerReturns500() async throws {
         let token = try makeSignedToken()
         let mockStore = MockCredentialStore()
         
@@ -212,10 +212,16 @@ final class ResilienceEvaluationTests: XCTestCase {
             apiClient: apiClient
         )
         
-        // 触发责任归属容灾判定：用户有网但服务端 502，属于服务方自身故障，静默放行！
-        let result = try await licenKit.validate()
-        XCTAssertTrue(result.valid)
-        XCTAssertTrue(result.reason?.contains("Fail-open granted") == true)
+        // 核心纠偏验证：主状态已过期时，绝不因服务端 502 伪造放行，必须抛出异常且保持过期！
+        do {
+            _ = try await licenKit.validate()
+            XCTFail("Should have thrown error when expired rather than granting fake validity")
+        } catch {
+            guard case .expired = licenKit.cachedStatus else {
+                XCTFail("Cached status should remain .expired")
+                return
+            }
+        }
     }
     
     func testValidateThrowsWhenGracePeriodExpiredAndDeviceIsPhysicallyOffline() async throws {
@@ -259,16 +265,14 @@ final class ResilienceEvaluationTests: XCTestCase {
             apiClient: apiClient
         )
         
-        // 触发责任归属判定：用户端断网且已过宽限期 -> 抛出提示联网错误
         do {
             _ = try await licenKit.validate()
             XCTFail("Should have thrown network error demanding reconnection")
-        } catch let err as LicenKitError {
-            guard case .networkError(let msg) = err else {
-                XCTFail("Expected .networkError, got \(err)")
+        } catch {
+            guard case .expired = licenKit.cachedStatus else {
+                XCTFail("Cached status should remain .expired")
                 return
             }
-            XCTAssertTrue(msg.contains("Please connect to internet"))
         }
     }
     
@@ -332,6 +336,195 @@ final class ResilienceEvaluationTests: XCTestCase {
         guard case .untrusted = licenKit.cachedStatus else {
             XCTFail("Status should be untrusted")
             return
+        }
+    }
+    
+    func testGatewayHtml404FallsBackToFailSilentWithoutRevokingLicense() async throws {
+        let token = try makeSignedToken()
+        let mockStore = MockCredentialStore()
+        
+        let creds = StoredCredentials(
+            licenseKey: "LIC-RESILIENCE-001",
+            token: token,
+            lastValidatedAt: Date().addingTimeInterval(-600),
+            offlineGracePeriod: 7 * 86400,
+            policyFeatures: ["pro"],
+            machineId: "m_001"
+        )
+        try mockStore.saveCredentials(creds, for: fixedFp)
+        
+        // 模拟网关/代理配置失误返回 HTML 404（非业务 JSON 404）
+        MockURLProtocol.lock.lock()
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 404,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let data = "<html><head><title>404 Not Found</title></head><body>nginx</body></html>".data(using: .utf8)!
+            return (response, data)
+        }
+        MockURLProtocol.lock.unlock()
+        
+        let mockMonitor = MockNetworkMonitor(initialOnline: true)
+        let coordinator = LicenKitRetryCoordinator(
+            networkMonitor: mockMonitor,
+            retryDelays: .fastForTesting
+        )
+        let apiClient = LicenKitAPIClient(
+            serverUrl: testConfig.serverUrl,
+            urlSession: mockSession
+        )
+        
+        let licenKit = LicenKit(
+            configuration: testConfig,
+            credentialStore: mockStore,
+            fingerprintProvider: FixedFingerprintProvider(fingerprint: fixedFp),
+            retryCoordinator: coordinator,
+            apiClient: apiClient
+        )
+        
+        // 网关 HTML 404 属于基础设施故障，绝不应误杀吊销，而是 Fail-Silent 保持可用
+        let result = try await licenKit.validate()
+        XCTAssertTrue(result.valid)
+        guard case .valid = licenKit.cachedStatus else {
+            XCTFail("Status should remain .valid and NOT be marked untrusted")
+            return
+        }
+    }
+    
+    func testRefreshSucceedsAndRestoresValidStatus() async throws {
+        let token = try makeSignedToken()
+        let mockStore = MockCredentialStore()
+        
+        // 状态原本已过期
+        let creds = StoredCredentials(
+            licenseKey: "LIC-RESILIENCE-001",
+            token: token,
+            lastValidatedAt: Date().addingTimeInterval(-10 * 86400),
+            offlineGracePeriod: 3 * 86400,
+            policyFeatures: ["pro"],
+            machineId: "m_001"
+        )
+        try mockStore.saveCredentials(creds, for: fixedFp)
+        
+        // 新生成的延期 Token
+        let renewedToken = try makeSignedToken(
+            issuedAt: Date(),
+            expiresAt: Date().addingTimeInterval(86400 * 365)
+        )
+        
+        // 服务端返回 200 刷新成功
+        MockURLProtocol.lock.lock()
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            let data = """
+            {
+                "success": true,
+                "data": {
+                    "valid": true,
+                    "token": "\(renewedToken)",
+                    "token_expires_at": "2027-09-18T00:00:00Z",
+                    "license_expires_at": "2027-09-18T00:00:00Z"
+                }
+            }
+            """.data(using: .utf8)!
+            return (response, data)
+        }
+        MockURLProtocol.lock.unlock()
+        
+        let mockMonitor = MockNetworkMonitor(initialOnline: true)
+        let coordinator = LicenKitRetryCoordinator(
+            networkMonitor: mockMonitor,
+            retryDelays: .fastForTesting
+        )
+        let apiClient = LicenKitAPIClient(
+            serverUrl: testConfig.serverUrl,
+            urlSession: mockSession
+        )
+        
+        let licenKit = LicenKit(
+            configuration: testConfig,
+            credentialStore: mockStore,
+            fingerprintProvider: FixedFingerprintProvider(fingerprint: fixedFp),
+            retryCoordinator: coordinator,
+            apiClient: apiClient
+        )
+        
+        // 用户在前台主动点击刷新
+        let result = try await licenKit.refresh()
+        XCTAssertTrue(result.valid)
+        XCTAssertEqual(result.token, renewedToken)
+        
+        // 验证主状态成功恢复为 .valid
+        guard case .valid = licenKit.cachedStatus else {
+            XCTFail("Cached status should be restored to .valid")
+            return
+        }
+    }
+    
+    func testRefreshThrowsOnNetworkErrorWithoutCorruptingStatus() async throws {
+        let token = try makeSignedToken()
+        let mockStore = MockCredentialStore()
+        
+        let creds = StoredCredentials(
+            licenseKey: "LIC-RESILIENCE-001",
+            token: token,
+            lastValidatedAt: Date().addingTimeInterval(-10 * 86400),
+            offlineGracePeriod: 3 * 86400,
+            policyFeatures: ["pro"],
+            machineId: "m_001"
+        )
+        try mockStore.saveCredentials(creds, for: fixedFp)
+        
+        // 模拟服务端 503 挂掉
+        MockURLProtocol.lock.lock()
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 503,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let data = "Service Unavailable".data(using: .utf8)!
+            return (response, data)
+        }
+        MockURLProtocol.lock.unlock()
+        
+        let mockMonitor = MockNetworkMonitor(initialOnline: true)
+        let coordinator = LicenKitRetryCoordinator(
+            networkMonitor: mockMonitor,
+            retryDelays: .fastForTesting
+        )
+        let apiClient = LicenKitAPIClient(
+            serverUrl: testConfig.serverUrl,
+            urlSession: mockSession
+        )
+        
+        let licenKit = LicenKit(
+            configuration: testConfig,
+            credentialStore: mockStore,
+            fingerprintProvider: FixedFingerprintProvider(fingerprint: fixedFp),
+            retryCoordinator: coordinator,
+            apiClient: apiClient
+        )
+        
+        // refresh 遇到网络故障应直接向调用方抛错供 UI Toast 提示
+        do {
+            _ = try await licenKit.refresh()
+            XCTFail("Refresh should throw network error on 503")
+        } catch {
+            // 主状态保持不变 (依旧是 .expired)
+            guard case .expired = licenKit.cachedStatus else {
+                XCTFail("Status should remain .expired")
+                return
+            }
         }
     }
 }

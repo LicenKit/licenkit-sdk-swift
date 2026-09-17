@@ -265,101 +265,136 @@ public final class LicenKit: @unchecked Sendable {
     }
     
     /// 在线发送心跳探活，刷新许可证状态并在必要时续签本地 Token
-    /// 在遭遇网络抖动、服务端 5xx 或网关异常时，自动执行离线降级与责任归属容灾处理
+    /// 遵循 Fail-Silent 原则：
+    /// - 若当前本地主状态可用，遇网络超时、服务端 5xx、429 或 Session 熔断，一律静默保底，维持本地主状态可用，零弹窗零干扰；
+    /// - 若当前本地主状态已不可用（已过期/试用结束），保持原判并抛出异常，绝不伪造放行。
     @discardableResult
     public func validate() async throws -> ValidationResult {
+        return try await executeValidation(scenario: .backgroundSync)
+    }
+    
+    /// 前台主动刷新授权（供用户在界面点击【刷新授权】或【检查续费】时调用）
+    /// 遵循前台交互语义：
+    /// - 重置当前 Session 熔断，采用前台重试策略 (foregroundActivation)；
+    /// - 成功获取新 Token 后更新本地凭据并恢复主状态；
+    /// - 若网络不可用或服务端故障，直接抛出异常供 UI 弹窗或 Toast 提示，主状态继续维持不变。
+    @discardableResult
+    public func refresh() async throws -> ValidationResult {
+        retryCoordinator.resetSessionBlock()
+        return try await executeValidation(scenario: .foregroundActivation)
+    }
+    
+    private func executeValidation(scenario: RequestScenario) async throws -> ValidationResult {
         let fingerprint = try await fingerprintProvider.getFingerprint()
         
         guard let creds = try credentialStore.loadCredentials(for: fingerprint) else {
             throw LicenKitError.unactivated
         }
         
-        // 若当前为免密试用凭据，向试用接口发起状态复核与续签
-        if creds.isTrial {
-            do {
-                let trialResult = try await requestTrial()
-                let isValid = !trialResult.expired && trialResult.token != nil
-                return ValidationResult(
-                    valid: isValid,
-                    token: trialResult.token,
-                    tokenExpiresAt: trialResult.expiresAt,
-                    licenseExpiresAt: trialResult.expiresAt,
-                    reason: isValid ? nil : "Trial expired"
-                )
-            } catch {
-                // 试用状态若遇网络不可用或 5xx，离线降级
-                let offlineStatus = try await verifyOffline()
-                switch offlineStatus {
-                case .trial(let claims):
-                    return ValidationResult(
-                        valid: true,
-                        token: creds.token,
-                        tokenExpiresAt: claims.expirationDate,
-                        licenseExpiresAt: claims.expirationDate,
-                        reason: "Validated offline (server unavailable, trial active)"
-                    )
-                case .trialExpired:
-                    throw LicenKitError.networkError("Server unavailable and trial has expired.")
-                default:
-                    throw error
-                }
-            }
+        // 读取当前本地离线客观主状态
+        let currentStatus = (try? await verifyOffline()) ?? .expired(claims: nil)
+        if case .untrusted(let reason) = currentStatus {
+            throw LicenKitError.cryptoError(reason)
         }
         
-        let request = ApiValidateRequest(
-            accountId: configuration.accountId,
-            licenseKey: creds.licenseKey,
-            fingerprint: fingerprint
-        )
-        
         do {
-            let response = try await retryCoordinator.execute(scenario: .backgroundSync) {
-                try await self.apiClient.validate(request: request)
-            }
-            
-            let tokenExpiresAt = response.tokenExpiresAt?.date
-            let licenseExpiresAt = response.licenseExpiresAt?.date
-            
-            // 若服务端判定无效（已吊销/已过期/未激活机器等），直接置为 untrusted，严防刷新本地宽限期
-            if !response.valid {
-                setCachedStatus(.untrusted(reason: response.reason ?? "License invalid or revoked by server"))
+            if creds.isTrial {
+                // 统一通过调度器执行 Trial 探活
+                let trialResponse = try await retryCoordinator.execute(scenario: scenario) {
+                    let request = ApiTrialRequest(
+                        accountId: self.configuration.accountId,
+                        productId: self.configuration.productId,
+                        fingerprint: fingerprint
+                    )
+                    return try await self.apiClient.requestTrial(request: request)
+                }
+                
+                let isValid = !trialResponse.expired && trialResponse.token != nil
+                if !isValid {
+                    if trialResponse.expired {
+                        setCachedStatus(.trialExpired(claims: currentStatus.trialClaims))
+                    } else {
+                        _ = try? await verifyOffline()
+                    }
+                    return ValidationResult(
+                        valid: false,
+                        token: trialResponse.token,
+                        tokenExpiresAt: trialResponse.expiresAt?.date,
+                        licenseExpiresAt: trialResponse.expiresAt?.date,
+                        reason: "Trial expired"
+                    )
+                }
+                
+                let updatedToken = trialResponse.token ?? creds.token
+                let updatedCreds = StoredCredentials(
+                    licenseKey: creds.licenseKey,
+                    token: updatedToken,
+                    lastValidatedAt: Date(),
+                    offlineGracePeriod: creds.offlineGracePeriod,
+                    policyFeatures: creds.policyFeatures,
+                    machineId: creds.machineId,
+                    isTrial: true
+                )
+                try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
+                _ = try? await verifyOffline()
+                
                 return ValidationResult(
-                    valid: false,
-                    token: response.token,
+                    valid: true,
+                    token: updatedToken,
+                    tokenExpiresAt: trialResponse.expiresAt?.date,
+                    licenseExpiresAt: trialResponse.expiresAt?.date
+                )
+            } else {
+                let request = ApiValidateRequest(
+                    accountId: configuration.accountId,
+                    licenseKey: creds.licenseKey,
+                    fingerprint: fingerprint
+                )
+                
+                let response = try await retryCoordinator.execute(scenario: scenario) {
+                    try await self.apiClient.validate(request: request)
+                }
+                
+                let tokenExpiresAt = response.tokenExpiresAt?.date
+                let licenseExpiresAt = response.licenseExpiresAt?.date
+                
+                // 若服务端明确业务拒绝 (valid == false) -> 严厉封锁置为 untrusted
+                if !response.valid {
+                    setCachedStatus(.untrusted(reason: response.reason ?? "License invalid or revoked by server"))
+                    return ValidationResult(
+                        valid: false,
+                        token: response.token,
+                        tokenExpiresAt: tokenExpiresAt,
+                        licenseExpiresAt: licenseExpiresAt,
+                        reason: response.reason
+                    )
+                }
+                
+                var updatedToken = creds.token
+                if let newToken = response.token, !newToken.isEmpty {
+                    updatedToken = newToken
+                }
+                
+                let updatedCreds = StoredCredentials(
+                    licenseKey: creds.licenseKey,
+                    token: updatedToken,
+                    lastValidatedAt: Date(),
+                    offlineGracePeriod: creds.offlineGracePeriod,
+                    policyFeatures: creds.policyFeatures,
+                    machineId: creds.machineId,
+                    isTrial: false
+                )
+                try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
+                _ = try? await verifyOffline()
+                
+                return ValidationResult(
+                    valid: true,
+                    token: updatedToken,
                     tokenExpiresAt: tokenExpiresAt,
                     licenseExpiresAt: licenseExpiresAt,
                     reason: response.reason
                 )
             }
-            
-            var updatedToken = creds.token
-            // 若服务端下发了最新 Token，则更新 Keychain
-            if let newToken = response.token, !newToken.isEmpty {
-                updatedToken = newToken
-            }
-            
-            let updatedCreds = StoredCredentials(
-                licenseKey: creds.licenseKey,
-                token: updatedToken,
-                lastValidatedAt: Date(),
-                offlineGracePeriod: creds.offlineGracePeriod,
-                policyFeatures: creds.policyFeatures,
-                machineId: creds.machineId,
-                isTrial: false
-            )
-            try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
-            
-            // 重新离线核验
-            _ = try? await verifyOffline()
-            
-            return ValidationResult(
-                valid: response.valid,
-                token: response.token,
-                tokenExpiresAt: tokenExpiresAt,
-                licenseExpiresAt: licenseExpiresAt,
-                reason: response.reason
-            )
-            
         } catch let error as LicenKitError {
             // 1. 业务级显式失效 (如 LICENSE_NOT_FOUND, MACHINE_REVOKED) -> 坚决封锁，不走降级
             if error.isExplicitBusinessRejection {
@@ -367,63 +402,35 @@ public final class LicenKit: @unchecked Sendable {
                 throw error
             }
             
-            // 2. 基础设施/网络/5xx/限流/Session 熔断 -> 自动离线降级
-            let offlineStatus = try await verifyOffline()
-            switch offlineStatus {
-            case .valid:
-                return ValidationResult(
-                    valid: true,
-                    token: creds.token,
-                    reason: "Validated offline (server unavailable, within grace period)"
-                )
-                
-            case .inGracePeriod(let claims, let remainingSeconds):
-                return ValidationResult(
-                    valid: true,
-                    token: creds.token,
-                    tokenExpiresAt: claims.expirationDate,
-                    reason: "Validated offline (in grace period, \(Int(remainingSeconds))s remaining)"
-                )
-                
-            case .expired:
-                // 宽限期已过：执行精细化责任归属判定
-                if !retryCoordinator.isOnline {
-                    // 责任归属：用户端完全断网 -> 提示需要联网验证
-                    throw LicenKitError.networkError("Offline grace period expired. Please connect to internet to verify license.")
-                }
-                
-                // 用户端有网络，但收到服务端 5xx
-                if error.isServerError {
-                    // 责任归属：服务端自营故障 -> 铁证自身故障，绝不惩罚正版用户，继续静默放行！
+            // 2. 基础设施/网络/5xx/限流/Session 熔断
+            if scenario == .backgroundSync {
+                // 后台探活：Fail-Silent 保底
+                if currentStatus.isValid {
                     return ValidationResult(
                         valid: true,
                         token: creds.token,
-                        reason: "Server error encountered but user is online. Fail-open granted."
+                        tokenExpiresAt: currentStatus.expirationDate,
+                        licenseExpiresAt: currentStatus.expirationDate,
+                        reason: "Fail-silent: server unavailable, retaining valid offline status"
                     )
+                } else {
+                    // 本地已明确过期：维持不可用，绝不伪造放行
+                    throw error
                 }
-                
-                // 中间链路超时或 DNS 解析异常：给予 48 小时紧急服务故障缓冲期
-                let emergencyBuffer: TimeInterval = 48 * 3600
-                let offlineDuration = Date().timeIntervalSince(creds.lastValidatedAt)
-                let totalAllowed = Double(creds.offlineGracePeriod) + emergencyBuffer
-                if offlineDuration <= totalAllowed {
-                    return ValidationResult(
-                        valid: true,
-                        token: creds.token,
-                        reason: "Network transient failure. Emergency 48h buffer applied."
-                    )
-                }
-                
-                throw LicenKitError.networkError("Server unavailable and offline grace period expired.")
-                
-            case .untrusted(let reason):
-                throw LicenKitError.cryptoError(reason)
-                
-            case .trial, .trialExpired:
+            } else {
+                // 前台主动刷新：抛出网络异常供 UI 明确处理
                 throw error
             }
         } catch {
-            // 非 LicenKitError 异常直接抛出
+            if scenario == .backgroundSync && currentStatus.isValid {
+                return ValidationResult(
+                    valid: true,
+                    token: creds.token,
+                    tokenExpiresAt: currentStatus.expirationDate,
+                    licenseExpiresAt: currentStatus.expirationDate,
+                    reason: "Fail-silent: server unavailable, retaining valid offline status"
+                )
+            }
             throw error
         }
     }

@@ -227,4 +227,50 @@ final class RetryCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.isSessionBlocked)
         XCTAssertTrue(coordinator.isOnline)
     }
+    
+    func testBackgroundSyncSecondAttemptRateLimitMarksRateLimitedForToday() async {
+        let mockMonitor = MockNetworkMonitor(initialOnline: true)
+        let coordinator = LicenKitRetryCoordinator(
+            networkMonitor: mockMonitor,
+            retryDelays: .fastForTesting,
+            userDefaults: testUserDefaults,
+            rateLimitKey: testRateLimitKey
+        )
+        
+        let attemptsLock = NSLock()
+        var attempts = 0
+        
+        do {
+            _ = try await coordinator.execute(scenario: .backgroundSync) {
+                attemptsLock.lock()
+                defer { attemptsLock.unlock() }
+                attempts += 1
+                if attempts == 1 {
+                    throw LicenKitError.apiError(code: "HTTP_500", message: "Server temporary failure")
+                } else {
+                    throw LicenKitError.apiError(code: "HTTP_429", message: "Rate limit on retry")
+                }
+            }
+            XCTFail("Should have thrown 429 on second attempt")
+        } catch {
+            attemptsLock.lock()
+            let finalAttempts = attempts
+            attemptsLock.unlock()
+            XCTAssertEqual(finalAttempts, 2)
+            XCTAssertTrue(coordinator.isRateLimitedToday)
+            XCTAssertTrue(coordinator.isSessionBlocked)
+        }
+    }
+    
+    func testSystemNetworkMonitorStartStopRestart() {
+        let monitor = SystemNetworkMonitor()
+        monitor.start { _ in }
+        XCTAssertTrue(monitor.isOnline)
+        monitor.stop()
+        
+        // 验证 stop() 之后再次调用 start() 能够正常重新实例化启动而不崩溃
+        monitor.start { _ in }
+        XCTAssertTrue(monitor.isOnline)
+        monitor.stop()
+    }
 }

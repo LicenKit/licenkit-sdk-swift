@@ -2,7 +2,7 @@
 
 **English** | [简体中文](zh-CN/FAULT_TOLERANCE_AND_DISASTER_RECOVERY.md)
 
-This document specifies the high-availability disaster recovery architecture, dual-track retry strategy, and graceful degradation mechanisms for **LicenKit** under unstable network conditions, server outages (e.g., HTTP 404, 500, 502, 503, 504), and offline environments.
+This document specifies the high-availability disaster recovery architecture, dual-track retry strategy, and Fail-Silent degradation mechanisms for **LicenKit** under unstable network conditions, server outages (e.g., HTTP 404, 500, 502, 503, 504), and offline environments.
 
 ---
 
@@ -10,42 +10,38 @@ This document specifies the high-availability disaster recovery architecture, du
 
 Software licensing systems operate across heterogeneous and unpredictable end-user network environments. Timeouts, firewall blocks, DNS resolution failures, reverse proxy issues, and server maintenance are inevitable realities. LicenKit adheres to the following foundational guidelines:
 
-### 1.1 Principle 1: Fail-Open on Infrastructure, Fail-Closed on Revocation
+### 1.1 Principle 1: Fail-Silent on Network/Infra, Fail-Closed on Revocation
 * **Business Continuity First**: Legitimate paying customers must never be locked out or interrupted due to server downtime or transient network interruptions.
 * **Separation of Concerns**:
-  * **Infrastructure Failures (5xx, timeouts, gateway errors)**: Execute a **Fail-Open** policy, maintaining full application access within the configured offline grace period.
-  * **Explicit Business Revocation (chargebacks, explicit deletions, seat revoking)**: Execute a **Fail-Closed** policy, terminating access and clearing credentials as required.
+  * **Transport & Infrastructure Faults (timeouts, network drops, 5xx, gateway errors)**: Execute a **Fail-Silent** policy. If local cryptographic status is currently valid, silently swallow transport exceptions and retain usable status with zero UI disruption.
+  * **Explicit Business Revocation (chargebacks, explicit license deletion, seat unbinding)**: Execute a **Fail-Closed** policy, transitioning status to `.untrusted` and terminating access.
 
-### 1.2 Principle 2: Blame-Aware Gating on Grace Expiration
-**"Never punish legitimate paying customers for server-side infrastructure faults."**  
-Even when the local offline grace period has fully expired, the SDK does NOT indiscriminately block the user. It evaluates responsibility based on network status and server responses:
-* **Attributed to User (Device physically offline)**:
-  Device is in airplane mode or disconnected from Wi-Fi beyond the grace period. The SDK displays a friendly notice: *"Offline grace period exceeded. Please connect to the internet to verify your license."* Users anticipate and accept this behavior.
-* **Attributed to Server (Device online, but server returns 5xx)**:
-  **Receiving HTTP 500/502/503/504 proves the request reached the edge and our server failed.** Legitimate users must not be penalized. **The SDK remains completely silent and fails open**, allowing continued full access.
-
-### 1.3 Principle 3: Offline-First Cryptographic Autonomy
+### 1.2 Principle 2: Local Cryptographic Sovereignty
 * **Decentralized Verification**: LicenKit is architected around **Ed25519 asymmetric cryptographic signatures** and **self-contained Claims Tokens**.
-* **Local Sovereignty**: Clients persist trusted tokens in Keychain. Cold-starts and routine feature gating rely exclusively on local public-key cryptography (< 1ms), treating the network purely as a synchronization channel.
+* **Local State Authority**: The primary state (`cachedStatus`) is governed by local public-key cryptography, hardware fingerprint matching, and timestamp constraints.
+* **No Pseudo-State Synthesis**: When a license is definitively expired locally (`.expired`), the SDK **never** falsely manufactures validity because the server returned a 5xx error. An expired license remains expired until legitimately renewed.
 
-### 1.4 Principle 4: Strict Error Bifurcation
-The SDK cleanly distinguishes between:
-1. **Transport & Infrastructure Errors**: Network unreachable, DNS failure, request timeout, HTTP 5xx, or non-API gateway 404s;
-2. **Explicit Business Rejection**: Structured JSON responses containing canonical error codes (e.g., `LICENSE_NOT_FOUND`, `MACHINE_REVOKED`) or `valid: false`.
+### 1.3 Principle 3: Strict Separation of Transport Codes vs. Business Outcomes
+* **Payload Dictates Business Status**:
+  * On `/validate` endpoints, the server returns HTTP `200 OK` with structured JSON payloads (`data.valid: false` and `reason`) to express business revoking.
+  * Non-2xx HTTP status codes (gateway 404, WAF 403, proxy 502/503, server 500) are purely **transport and infrastructure errors** and are never treated as business revocations.
+
+### 1.4 Principle 4: Dual API Architecture (Silent Sync vs. User-Initiated Renewal)
+* **Background Silent Sync (`validate()`)**: Executed after app launch in the background. Employs `backgroundSync` retry logic and Fail-Silent semantics; silent on failure.
+* **Foreground User-Initiated Renewal (`refresh()`)**: Executed when user taps "Refresh License / Check Renewal" in UI. Resets circuit breaker, applies `foregroundActivation` retry logic, and provides explicit success/failure feedback to UI.
 
 ---
 
 ## 2. Error Taxonomy & Resilience Matrix
 
-| Failure Type | Symptoms & HTTP Status | Root Nature | Within Grace Period | After Grace Expiration | Effect on Credentials |
+| Failure Type | Symptoms & HTTP Status | Root Nature | When Local Status is Valid | When Local Status is Expired | Effect on Credentials |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Internal Server Error** | HTTP `500 Internal Server Error` | Edge engine or database fault | **Offline fallback**: Verify token & grant access | **[Server Fault] Fail-Open**: Continue silent access | **Never clear**; retain credentials |
-| **Gateway & Proxy Outage** | HTTP `502 / 503 / 504` | Proxy down, deploy in progress, gateway timeout | **Offline fallback**: Grant access; schedule retry | **[Server Fault] Fail-Open**: Continue silent access | **Never clear**; retain credentials |
-| **Unstructured Gateway 404** | HTTP `404 Not Found`<br>(HTML page or proxy error) | Route misconfigured or Base URL invalid | **Treated as infrastructure error**: Grant access | **[Config Error] Fail-Open**: Log warning | **Never clear**; retain credentials |
-| **Client Physical Offline** | No network, airplane mode, unplugged cable | Transport unreachable (user network environment) | **Offline fallback**: Grant access | **[User Responsibility] State `.expired`**: Prompt to connect to internet | **Never clear**; wait for re-connect |
-| **Transient Link Flapping** | Device online, but domain unreachable | Intermediate route jitter or local firewall block | **Offline fallback**: Grant access | **Emergency 48h buffer**: Silent access before warning | **Never clear**; retain credentials |
-| **Business-Level 404** | HTTP `404 / 422`<br>(JSON `code: "LICENSE_NOT_FOUND"`) | License key was purged or deleted on server | **Explicit business failure**: Terminate access | **Explicit business failure**: Terminate access | **Mark revoked / Clear credentials** |
-| **Machine Seat Revoked** | HTTP `200` (`valid: false`) or<br>`code: "MACHINE_DEACTIVATED"` | Administrator revoked device seat from dashboard | **Explicit business failure**: Terminate access | **Explicit business failure**: Terminate access | **Mark revoked / Clear credentials** |
+| **Internal Server Error** | HTTP `500 Internal Server Error` | Edge engine or database fault | **Fail-Silent**: Retain valid status silently | **Remain `.expired`**: No fake validity | **Never clear**; retain credentials |
+| **Gateway & Proxy Outage** | HTTP `502 / 503 / 504` | Proxy down, deploy in progress, gateway timeout | **Fail-Silent**: Retain valid status silently | **Remain `.expired`**: No fake validity | **Never clear**; retain credentials |
+| **Unstructured Gateway 404** | HTTP `404 Not Found`<br>(HTML page or proxy error) | Route misconfigured or Base URL invalid | **Fail-Silent**: Retain valid status silently | **Remain `.expired`**: No fake validity | **Never clear**; retain credentials |
+| **WAF / Captive Portal 403** | HTTP `403 Forbidden`<br>(Cloudflare WAF / Hotel Wi-Fi portal) | Transport restricted, not business revocation | **Fail-Silent**: Retain valid status silently | **Remain `.expired`**: Prompt user to check Wi-Fi | **Never clear**; retain credentials |
+| **Client Physical Offline** | No network, airplane mode, unplugged cable | Transport unreachable (user network environment) | **Fail-Silent**: Retain valid status silently | **Remain `.expired`**: Prompt to connect to internet | **Never clear**; wait for re-connect |
+| **Explicit Business Revocation** | HTTP `200` (`data.valid == false`) or structured code | Administrator unpinned machine, license deleted | **Explicit business failure**: Set `.untrusted` | **Explicit business failure**: Set `.untrusted` | **Mark untrusted / clear seat** |
 | **Active Deactivation** | Caller invokes `deactivate()` | User initiates sign-out / device release | **Local-first**: Immediately purge locally | **Local-first**: Immediately purge locally | **Immediately purged** |
 
 ---
@@ -54,36 +50,38 @@ The SDK cleanly distinguishes between:
 
 To avoid thundering herd storms (DDoS) against the server and UI freezes, retries are strictly bifurcated by request type:
 
-| Dimension | Track A: Foreground Blocking (`activate`) | Track B: Background Silent (`validate` / Heartbeat) |
+| Dimension | Track A: Foreground Blocking (`activate` / `refresh`) | Track B: Background Silent (`validate`) |
 | :--- | :--- | :--- |
-| **Typical Context** | User inputs license key, clicks "Restore License" | Silent startup verification, periodic background sync |
+| **Typical Context** | User inputs license key, taps "Refresh License" | Silent startup verification, periodic background sync |
 | **UI & Psychology** | Loading spinner on modal; user tolerance is ~10-15s | **Completely silent**; user is actively working in the app |
 | **Recoverable 5xx & Timeouts** | **Up to 3 retries**<br>Backoff: **2s $\rightarrow$ 4s $\rightarrow$ 8s** (+ light jitter) | **Max 1 retry (2 attempts total)**<br>Wait **$\ge 60$s** before 2nd attempt; if still failing, **abandon retries for this session** |
-| **Rate Limiting (429)** | **Up to 3 retries**<br>Backoff: **4s $\rightarrow$ 8s $\rightarrow$ 16s** (rare on Cloudflare) | **Immediately abort, stop for the rest of the day**<br>Persist cooldown timestamp (`rateLimitedUntil`), skip sync for 24h |
-| **Business Rejections (404/409)** | **0 retries**, fail immediately and display reason | **0 retries**, mark license invalid |
-| **Terminal Outcome** | Display clear error modal with "Retry" button | **Seamless fallback** to local `verifyOffline()`; zero disruption |
+| **Rate Limiting (429)** | **Up to 3 retries**<br>Backoff: **4s $\rightarrow$ 8s $\rightarrow$ 16s** | **Immediately abort, stop for the rest of the day**<br>Persist cooldown timestamp (`rateLimitedUntil`), skip sync for 24h |
+| **Business Rejections (valid == false)** | **0 retries**, fail immediately and display reason | **0 retries**, mark license invalid (`.untrusted`) |
+| **Terminal Outcome** | Throw explicit network error for UI alert/toast | **Fail-Silent**: Retain usable status; or remain expired |
 
 ---
 
-## 4. Gating Flow on Grace Period Expiration
+## 4. Gating Flow
 
 ```mermaid
 flowchart TD
-    OverGrace["Grace Period Expired"] --> CheckNet{"Device Physical Network?<br/>(NWPathMonitor)"}
+    subgraph BackgroundSync ["Background Silent Sync: validate()"]
+        Start["Call validate()"] --> CheckLocal{"Current Local Status<br/>(verifyOffline)"}
+        
+        CheckLocal -- ".valid or .inGracePeriod<br/>(Status is Usable)" --> RunBg["Run backgroundSync<br/>(Wait 60s, retry once)"]
+        RunBg -- "Network fail / 5xx / 429 / Circuit break" --> FailSilent["【Fail-Silent】<br/>Swallow error, keep .valid<br/>Zero UI disruption, app works"]
+        RunBg -- "HTTP 200 & valid: true" --> SyncOk["Refresh local credentials<br/>Status refreshed"]
+        RunBg -- "HTTP 200 & valid: false<br/>(Server revoked)" --> Revoke["【Business Revocation】<br/>Mark .untrusted, block access"]
 
-    CheckNet -- "Unsatisfied (Offline)<br/>Airplane mode / No Wi-Fi" --> UserFault["[User Responsibility]<br/>Status: .expired<br/>Prompt: Please connect to the internet"]
+        CheckLocal -- ".expired or .trialExpired<br/>(Already Expired)" --> ExpiredNotice["【Retain Expired State】<br/>No fake validity! Keep .expired<br/>Prompt user to renew"]
+    end
 
-    CheckNet -- "Satisfied (Online)" --> SendReq["Send validation request to LicenKit"]
-    SendReq --> CheckResp{"Response Status Code"}
-
-    CheckResp -- "HTTP 200 (valid == true)" --> Success["Success! Refresh local grace period"]
-    CheckResp -- "Business 4xx Rejection<br/>(LICENSE_NOT_FOUND / 403 Revoked)" --> BusinessFail["[Business Revocation]<br/>Status: .untrusted, block access"]
-    
-    CheckResp -- "HTTP 500 / 502 / 503 / 504<br/>(Genuine 5xx Status Code)" --> OurFault["[Server Fault Confirmed]<br/>Proof that network reached edge.<br/>Decision: Fail-open silently! Status: .valid"]
-    
-    CheckResp -- "Domain Timeout / DNS Failure" --> TimeoutFault{"Within 48h Emergency Buffer?"}
-    TimeoutFault -- "Yes (<= 48h)" --> EmergencyGrace["Grant emergency silent access"]
-    TimeoutFault -- "No (> 48h)" --> NetworkCheckWarn["Prompt user to check local firewall/network"]
+    subgraph ForegroundRefresh ["Foreground Active Renewal: refresh()"]
+        UserClick["User taps 'Refresh License'"] --> ResetSession["Reset session circuit breaker"]
+        ResetSession --> RunFg["Execute foregroundActivation<br/>(Backoff: 2s -> 4s -> 8s)"]
+        RunFg -- "Network succeeded & renewed" --> RefreshOk["Save token, restore .valid"]
+        RunFg -- "Network still fails / 5xx" --> ToastErr["Throw error directly to UI<br/>Toast: Failed to reach server"]
+    end
 ```
 
 ---

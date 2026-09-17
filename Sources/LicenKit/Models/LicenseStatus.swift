@@ -30,6 +30,11 @@ public enum LicenseStatus: Equatable, Sendable {
         }
     }
     
+    /// 判定当前许可证状态是否合法生效 (isUsable 的等价语义别名)
+    public var isValid: Bool {
+        return isUsable
+    }
+    
     /// 是否处于试用状态 (进行中或已过期)
     public var isTrial: Bool {
         switch self {
