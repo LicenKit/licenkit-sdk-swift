@@ -19,6 +19,15 @@ public struct LicenKitAPIClient: Sendable {
     
     // MARK: - API Calls
     
+    /// 向服务端请求试用认领
+    public func requestTrial(request: ApiTrialRequest) async throws -> ApiTrialResponse {
+        return try await sendRequest(
+            path: "/api/v1/client/trial",
+            method: "POST",
+            body: request
+        )
+    }
+    
     /// 向服务端发起设备激活
     public func activate(request: ApiActivateRequest) async throws -> ApiActivateResponse {
         return try await sendRequest(

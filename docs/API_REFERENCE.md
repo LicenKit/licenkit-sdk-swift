@@ -37,16 +37,29 @@ public static var shared: LicenKit { get }
 ### 1.2 核心操作接口
 
 #### `verifyOffline() async throws -> LicenseStatus`
-纯本地、脱网执行 Ed25519 签名核验与硬件指纹比对，0 网络延迟。
+纯本地、脱网执行 Ed25519 签名核验与硬件指纹比对，0 网络延迟。自动兼容正式版商业许可证与免费试用版 Token。
 
 ```swift
 public func verifyOffline() async throws -> LicenseStatus
 ```
-- **返回值**：当前许可证状态枚举 `LicenseStatus`。
+- **返回值**：当前许可证状态枚举 `LicenseStatus`（如 `.valid`、`.trial`、`.inGracePeriod` 等）。
 - **可能抛出的错误**：
   - `LicenKitError.unactivated`: 本地 Keychain 中无任何凭据。
   - `LicenKitError.invalidToken(reason)`: 凭据格式损坏或反序列化失败。
   - `LicenKitError.cryptoError(reason)`: Ed25519 验签失败（公钥不匹配或内容被篡改）。
+
+---
+
+#### `requestTrial() async throws -> TrialResult`
+向服务端申请单机免密免费试用，自动验签 `LK-TRIAL` 离线 Token 并安全保存至本地 Keychain。
+
+```swift
+public func requestTrial() async throws -> TrialResult
+```
+- **返回值**：`TrialResult`，包含试用认领结果、是否已认领过、过期时间及可用特性清单。
+- **可能抛出的错误**：
+  - `LicenKitError.apiError(code, message)`: 产品未开启试用（如 `TRIAL_NOT_AVAILABLE`）或服务异常。
+  - `LicenKitError.networkError(message)`: 网络连接失败。
 
 ---
 
@@ -144,8 +157,11 @@ public struct LicenKitConfiguration: Sendable {
 
 ```swift
 public enum LicenseStatus: Equatable, Sendable {
-    /// 许可证完全有效
+    /// 商业许可证完全有效
     case valid(claims: LicenseClaims)
+    
+    /// 免费试用期内有效
+    case trial(claims: TrialClaims)
     
     /// 脱网宽限期中（当前处于离线，但距上次校验仍在允许的宽限期内）
     case inGracePeriod(claims: LicenseClaims, remainingGraceSeconds: TimeInterval)
@@ -153,16 +169,24 @@ public enum LicenseStatus: Equatable, Sendable {
     /// 许可证已过期
     case expired(claims: LicenseClaims?)
     
+    /// 试用期已结束
+    case trialExpired(claims: TrialClaims?)
+    
     /// 凭据不可信（签名伪造、指纹不匹配等安全异常）
     case untrusted(reason: String)
 }
 ```
 
-### 3.2 离线荷载声明：`LicenseClaims`
+- `isUsable`: 判定当前状态是否允许应用核心功能放行运行（在 `.valid`、`.trial`、`.inGracePeriod` 时为 `true`）。
+- `isTrial`: 判定当前是否处于试用状态（`.trial` 或 `.trialExpired`）。
+- `features`: 统一获取当前授权或试用下发的功能特性数组 `[String]`。
 
+### 3.2 离线荷载声明：`LicenseClaims` 与 `TrialClaims`
+
+#### 商业许可证 Claims (`LicenseClaims`)
 ```swift
 public struct LicenseClaims: Codable, Equatable, Sendable {
-    public let type: String              // "license" 或 "trial"
+    public let typ: String              // "license"
     public let licenseId: String         // 授权内部唯一标识
     public let licenseKey: String        // 授权码 (sub)
     public let accountId: String         // 账户 ID (acc)
@@ -175,7 +199,20 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
 }
 ```
 
-### 3.3 激活结果：`ActivationResult`
+#### 免费试用 Claims (`TrialClaims`)
+```swift
+public struct TrialClaims: Codable, Equatable, Sendable {
+    public let typ: String              // "trial"
+    public let accountId: String         // 账户 ID (acc)
+    public let productId: String         // 产品 ID (prd)
+    public let fingerprint: String       // 绑定的硬件指纹 (fp)
+    public let issuedAt: Date            // 试用启动时间
+    public let expirationDate: Date      // 试用到期时间
+    public let features: [String]        // 试用开放的功能特性列表 (fea)
+}
+```
+
+### 3.3 操作结果：`ActivationResult` 与 `TrialResult`
 
 ```swift
 public struct ActivationResult: Sendable {
@@ -183,9 +220,19 @@ public struct ActivationResult: Sendable {
     public let reused: Bool              // 是否重用了历史激活席位
     public let machineId: String         // 席位唯一标识
     public let token: String             // 签名的离线 Token
-    public let expiresAt: Date?          // 授权到期时间
-    public let policyName: String        // 关联的策略名称
-    public let features: [String]        // 授权特性
+    public let tokenExpiresAt: Date?     // Token 本身有效期
+    public let licenseExpiresAt: Date?   // 商业授权到期时间
+    public let policy: ApiPolicyInfo     // 关联的策略信息
+}
+
+public struct TrialResult: Sendable {
+    public let trialClaimed: Bool        // 试用是否认领成功
+    public let alreadyClaimed: Bool      // 是否为历史已认领设备
+    public let expired: Bool             // 试用是否已过期
+    public let token: String?            // 离线试用 Token (已过期为 nil)
+    public let claimedAt: Date?          // 首次认领时间
+    public let expiresAt: Date?          // 试用到期时间
+    public let features: [String]        // 试用特性列表
 }
 ```
 

@@ -107,4 +107,55 @@ public struct TrialClaims: Codable, Equatable, Sendable {
     public var isExpired: Bool {
         Date() > expirationDate
     }
+    
+    public init(
+        typ: String = "trial",
+        accountId: String,
+        productId: String,
+        fingerprint: String,
+        issuedAtTimestamp: Int64,
+        expirationTimestamp: Int64,
+        features: [String] = []
+    ) {
+        self.typ = typ
+        self.accountId = accountId
+        self.productId = productId
+        self.fingerprint = fingerprint
+        self.issuedAtTimestamp = issuedAtTimestamp
+        self.expirationTimestamp = expirationTimestamp
+        self.features = features
+    }
+}
+
+/// 聚合离线 Claims 枚举 (正式授权与试用授权)
+public enum OfflineClaims: Equatable, Sendable {
+    case license(LicenseClaims)
+    case trial(TrialClaims)
+    
+    public var fingerprint: String {
+        switch self {
+        case .license(let claims):
+            return claims.fingerprint
+        case .trial(let claims):
+            return claims.fingerprint
+        }
+    }
+    
+    public var features: [String] {
+        switch self {
+        case .license(let claims):
+            return claims.features
+        case .trial(let claims):
+            return claims.features
+        }
+    }
+    
+    public var expirationDate: Date {
+        switch self {
+        case .license(let claims):
+            return claims.expirationDate
+        case .trial(let claims):
+            return claims.expirationDate
+        }
+    }
 }

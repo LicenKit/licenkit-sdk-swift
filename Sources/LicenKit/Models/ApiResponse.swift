@@ -214,3 +214,75 @@ public struct ValidationResult: Sendable {
     public let licenseExpiresAt: Date?
     public let reason: String?
 }
+
+// MARK: - Trial
+
+public struct ApiTrialRequest: Codable, Sendable {
+    public let accountId: String
+    public let productId: String
+    public let fingerprint: String
+    
+    enum CodingKeys: String, CodingKey {
+        case accountId = "account_id"
+        case productId = "product_id"
+        case fingerprint
+    }
+    
+    public init(accountId: String, productId: String, fingerprint: String) {
+        self.accountId = accountId
+        self.productId = productId
+        self.fingerprint = fingerprint
+    }
+}
+
+public struct ApiTrialResponse: Codable, Sendable {
+    public let trialClaimed: Bool
+    public let alreadyClaimed: Bool
+    public let expired: Bool
+    public let claimedAt: FlexibleDate?
+    public let expiresAt: FlexibleDate?
+    public let claimedAtIso: String?
+    public let expiresAtIso: String?
+    public let token: String?
+    public let features: [String]
+    
+    enum CodingKeys: String, CodingKey {
+        case trialClaimed = "trial_claimed"
+        case alreadyClaimed = "already_claimed"
+        case expired
+        case claimedAt = "claimed_at"
+        case expiresAt = "expires_at"
+        case claimedAtIso = "claimed_at_iso"
+        case expiresAtIso = "expires_at_iso"
+        case token
+        case features
+    }
+}
+
+public struct TrialResult: Sendable {
+    public let trialClaimed: Bool
+    public let alreadyClaimed: Bool
+    public let expired: Bool
+    public let token: String?
+    public let claimedAt: Date?
+    public let expiresAt: Date?
+    public let features: [String]
+    
+    public init(
+        trialClaimed: Bool,
+        alreadyClaimed: Bool,
+        expired: Bool,
+        token: String?,
+        claimedAt: Date?,
+        expiresAt: Date?,
+        features: [String]
+    ) {
+        self.trialClaimed = trialClaimed
+        self.alreadyClaimed = alreadyClaimed
+        self.expired = expired
+        self.token = token
+        self.claimedAt = claimedAt
+        self.expiresAt = expiresAt
+        self.features = features
+    }
+}

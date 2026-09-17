@@ -8,6 +8,7 @@ public struct StoredCredentials: Codable, Sendable {
     public let offlineGracePeriod: Int
     public let policyFeatures: [String]
     public let machineId: String
+    public let isTrial: Bool
     
     public init(
         licenseKey: String,
@@ -15,7 +16,8 @@ public struct StoredCredentials: Codable, Sendable {
         lastValidatedAt: Date,
         offlineGracePeriod: Int,
         policyFeatures: [String],
-        machineId: String
+        machineId: String,
+        isTrial: Bool = false
     ) {
         self.licenseKey = licenseKey
         self.token = token
@@ -23,6 +25,28 @@ public struct StoredCredentials: Codable, Sendable {
         self.offlineGracePeriod = offlineGracePeriod
         self.policyFeatures = policyFeatures
         self.machineId = machineId
+        self.isTrial = isTrial
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case licenseKey
+        case token
+        case lastValidatedAt
+        case offlineGracePeriod
+        case policyFeatures
+        case machineId
+        case isTrial
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.licenseKey = try container.decodeIfPresent(String.self, forKey: .licenseKey) ?? ""
+        self.token = try container.decode(String.self, forKey: .token)
+        self.lastValidatedAt = try container.decode(Date.self, forKey: .lastValidatedAt)
+        self.offlineGracePeriod = try container.decodeIfPresent(Int.self, forKey: .offlineGracePeriod) ?? 0
+        self.policyFeatures = try container.decodeIfPresent([String].self, forKey: .policyFeatures) ?? []
+        self.machineId = try container.decodeIfPresent(String.self, forKey: .machineId) ?? ""
+        self.isTrial = try container.decodeIfPresent(Bool.self, forKey: .isTrial) ?? false
     }
 }
 

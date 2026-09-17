@@ -61,4 +61,38 @@ public struct ClaimsEvaluator: Sendable {
         // 5. 正常有效
         return .valid(claims: claims)
     }
+    
+    /// 综合评估 TrialClaims 在当前设备与系统约束下的试用生效状态
+    /// - Parameters:
+    ///   - claims: 已通过 Ed25519 签名验证的 TrialClaims
+    ///   - currentFingerprint: 当前设备采集到的硬件指纹
+    /// - Returns: 许可证状态枚举 (.trial / .trialExpired / .untrusted)
+    public func evaluateTrial(
+        claims: TrialClaims,
+        currentFingerprint: String
+    ) -> LicenseStatus {
+        let now = Date()
+        
+        // 1. 硬件指纹一致性防伪检查
+        let expectedFp = claims.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let actualFp = currentFingerprint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        
+        guard expectedFp == actualFp else {
+            return .untrusted(reason: "Hardware fingerprint mismatch: trial token is bound to '\(claims.fingerprint)', but current host is '\(currentFingerprint)'")
+        }
+        
+        // 2. 本地系统时钟漂移防伪检查 (允许 1 小时容差)
+        let clockSkewLeeway: TimeInterval = 3600
+        if now < claims.issuedAt.addingTimeInterval(-clockSkewLeeway) {
+            return .untrusted(reason: "System clock anomaly: current time is more than 1 hour earlier than trial token issue time")
+        }
+        
+        // 3. 试用期到期判定
+        if now > claims.expirationDate {
+            return .trialExpired(claims: claims)
+        }
+        
+        // 4. 试用期正常生效
+        return .trial(claims: claims)
+    }
 }

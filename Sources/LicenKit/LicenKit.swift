@@ -83,22 +83,96 @@ public final class LicenKit: @unchecked Sendable {
             throw LicenKitError.unactivated
         }
         
-        // 执行 Ed25519 签名验证与反序列化
-        let (_, claims): (OfflineTokenHeader, LicenseClaims) = try ed25519Verifier.verifyAndDecodeToken(
+        // 执行自适应 Ed25519 签名验证与反序列化 (支持正式版 License 与免密 Trial)
+        let (_, claims) = try ed25519Verifier.verifyAndDecodeAnyToken(
             token: creds.token,
             publicKeyInput: configuration.publicKey
         )
         
-        // 评估当前运行态约束
-        let status = claimsEvaluator.evaluate(
-            claims: claims,
-            currentFingerprint: fingerprint,
-            lastValidatedAt: creds.lastValidatedAt,
-            offlineGracePeriodSeconds: Double(creds.offlineGracePeriod)
-        )
+        let status: LicenseStatus
+        switch claims {
+        case .license(let licenseClaims):
+            status = claimsEvaluator.evaluate(
+                claims: licenseClaims,
+                currentFingerprint: fingerprint,
+                lastValidatedAt: creds.lastValidatedAt,
+                offlineGracePeriodSeconds: Double(creds.offlineGracePeriod)
+            )
+        case .trial(let trialClaims):
+            status = claimsEvaluator.evaluateTrial(
+                claims: trialClaims,
+                currentFingerprint: fingerprint
+            )
+        }
         
         setCachedStatus(status)
         return status
+    }
+    
+    /// 向服务端发起设备免费试用认领，并持久化试用凭据至 Keychain
+    @discardableResult
+    public func requestTrial() async throws -> TrialResult {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        
+        let request = ApiTrialRequest(
+            accountId: configuration.accountId,
+            productId: configuration.productId,
+            fingerprint: fingerprint
+        )
+        
+        let response = try await apiClient.requestTrial(request: request)
+        
+        let claimedAt = response.claimedAt?.date
+        let expiresAt = response.expiresAt?.date
+        
+        // 若服务端判定已过期或未下发 Token
+        guard let token = response.token, !token.isEmpty, !response.expired else {
+            let expiredResult = TrialResult(
+                trialClaimed: response.trialClaimed,
+                alreadyClaimed: response.alreadyClaimed,
+                expired: true,
+                token: response.token,
+                claimedAt: claimedAt,
+                expiresAt: expiresAt,
+                features: response.features
+            )
+            setCachedStatus(.trialExpired(claims: nil))
+            return expiredResult
+        }
+        
+        // 首次脱网验签自检，确保证书本地立即可用
+        let (_, trialClaims): (OfflineTokenHeader, TrialClaims) = try ed25519Verifier.verifyAndDecodeToken(
+            token: token,
+            publicKeyInput: configuration.publicKey
+        )
+        
+        // 保存试用凭据至 Keychain (免密钥标记 isTrial = true)
+        let creds = StoredCredentials(
+            licenseKey: "",
+            token: token,
+            lastValidatedAt: Date(),
+            offlineGracePeriod: 0,
+            policyFeatures: response.features,
+            machineId: "",
+            isTrial: true
+        )
+        try credentialStore.saveCredentials(creds, for: fingerprint)
+        
+        let status = claimsEvaluator.evaluateTrial(
+            claims: trialClaims,
+            currentFingerprint: fingerprint
+        )
+        setCachedStatus(status)
+        
+        return TrialResult(
+            trialClaimed: response.trialClaimed,
+            alreadyClaimed: response.alreadyClaimed,
+            expired: response.expired,
+            token: token,
+            claimedAt: claimedAt ?? trialClaims.issuedAt,
+            expiresAt: expiresAt ?? trialClaims.expirationDate,
+            features: response.features
+        )
     }
     
     /// 在线激活当前设备席位，并持久化新凭据至 Keychain
@@ -191,6 +265,19 @@ public final class LicenKit: @unchecked Sendable {
             throw LicenKitError.unactivated
         }
         
+        // 若当前为免密试用凭据，向试用接口发起状态复核与续签
+        if creds.isTrial {
+            let trialResult = try await requestTrial()
+            let isValid = !trialResult.expired && trialResult.token != nil
+            return ValidationResult(
+                valid: isValid,
+                token: trialResult.token,
+                tokenExpiresAt: trialResult.expiresAt,
+                licenseExpiresAt: trialResult.expiresAt,
+                reason: isValid ? nil : "Trial expired"
+            )
+        }
+        
         let request = ApiValidateRequest(
             accountId: configuration.accountId,
             licenseKey: creds.licenseKey,
@@ -225,7 +312,8 @@ public final class LicenKit: @unchecked Sendable {
             lastValidatedAt: Date(),
             offlineGracePeriod: creds.offlineGracePeriod,
             policyFeatures: creds.policyFeatures,
-            machineId: creds.machineId
+            machineId: creds.machineId,
+            isTrial: false
         )
         try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
         
@@ -263,7 +351,7 @@ public final class LicenKit: @unchecked Sendable {
             setCachedStatus(.untrusted(reason: "Deactivated"))
         }
         
-        if let creds = savedCreds, let fp = fingerprint {
+        if let creds = savedCreds, let fp = fingerprint, !creds.isTrial, !creds.licenseKey.isEmpty {
             let request = ApiDeactivateRequest(
                 accountId: configuration.accountId,
                 licenseKey: creds.licenseKey,

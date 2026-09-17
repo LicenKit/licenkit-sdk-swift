@@ -69,6 +69,77 @@ public struct Ed25519Verifier: Sendable {
         }
     }
     
+    /// 解析并离线验签 Token，自适应识别为正式版 LicenseClaims 或试用版 TrialClaims
+    public func verifyAndDecodeAnyToken(
+        token: String,
+        publicKeyInput: String
+    ) throws -> (header: OfflineTokenHeader, claims: OfflineClaims) {
+        let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: ".")
+        guard parts.count == 3 else {
+            throw LicenKitError.invalidToken("Malformed token format: expected 3 dot-separated segments")
+        }
+        
+        let headerPart = parts[0]
+        let payloadPart = parts[1]
+        let signaturePart = parts[2]
+        
+        let signedDataString = "\(headerPart).\(payloadPart)"
+        guard let signedData = signedDataString.data(using: .utf8) else {
+            throw LicenKitError.invalidToken("Unable to encode signed data to UTF-8")
+        }
+        
+        guard let signatureData = decodeBase64Url(signaturePart) else {
+            throw LicenKitError.invalidToken("Failed to decode signature from Base64URL")
+        }
+        
+        guard signatureData.count == 64 else {
+            throw LicenKitError.cryptoError("Invalid Ed25519 signature length: expected 64 bytes, got \(signatureData.count)")
+        }
+        
+        let rawPublicKeyData = try extractRawEd25519PublicKey(from: publicKeyInput)
+        guard let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: rawPublicKeyData) else {
+            throw LicenKitError.cryptoError("Failed to initialize CryptoKit Ed25519 public key")
+        }
+        
+        let isSignatureValid = publicKey.isValidSignature(signatureData, for: signedData)
+        guard isSignatureValid else {
+            throw LicenKitError.cryptoError("Cryptographic signature verification failed (Token tampered or wrong public key)")
+        }
+        
+        guard let headerData = decodeBase64Url(headerPart),
+              let header = try? JSONDecoder().decode(OfflineTokenHeader.self, from: headerData) else {
+            throw LicenKitError.invalidToken("Failed to decode or parse token header")
+        }
+        
+        guard let payloadData = decodeBase64Url(payloadPart) else {
+            throw LicenKitError.invalidToken("Failed to decode token payload bytes")
+        }
+        
+        struct Probe: Decodable {
+            let typ: String?
+        }
+        let probe = try? JSONDecoder().decode(Probe.self, from: payloadData)
+        
+        if header.typ == "LK-TRIAL" || probe?.typ == "trial" {
+            do {
+                let trialClaims = try JSONDecoder().decode(TrialClaims.self, from: payloadData)
+                return (header, .trial(trialClaims))
+            } catch {
+                throw LicenKitError.invalidToken("Failed to deserialize trial claims: \(error.localizedDescription)")
+            }
+        } else {
+            do {
+                let licenseClaims = try JSONDecoder().decode(LicenseClaims.self, from: payloadData)
+                return (header, .license(licenseClaims))
+            } catch {
+                if let trialClaims = try? JSONDecoder().decode(TrialClaims.self, from: payloadData) {
+                    return (header, .trial(trialClaims))
+                }
+                throw LicenKitError.invalidToken("Failed to deserialize license claims: \(error.localizedDescription)")
+            }
+        }
+    }
+    
     /// 从原始 Base64 或 SPKI 格式中提取标准的 32 字节 Ed25519 公钥字节流
     public func extractRawEd25519PublicKey(from input: String) throws -> Data {
         let cleanInput = input
