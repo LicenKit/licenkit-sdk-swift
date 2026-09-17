@@ -145,7 +145,7 @@ public struct LicenKitAPIClient: Sendable {
         if !apiResponse.success || apiResponse.data == nil {
             let serverCode = apiResponse.error?.code
             let message = apiResponse.error?.message ?? "Server rejected request"
-            if serverCode == "MAX_MACHINES_REACHED" || httpResponse.statusCode == 409 {
+            if serverCode == "MAX_MACHINES_REACHED" || serverCode == "SEAT_LIMIT_EXCEEDED" || httpResponse.statusCode == 409 {
                 throw LicenKitError.maxMachinesReached
             }
             
