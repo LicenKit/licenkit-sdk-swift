@@ -51,4 +51,56 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
             return "LicenKit is not initialized. Please call LicenKit.configure(with:) first."
         }
     }
+    
+    /// 判定是否属于 HTTP 5xx 等服务端故障
+    public var isServerError: Bool {
+        if case .apiError(let code, _) = self {
+            return code.hasPrefix("HTTP_5") || code == "INTERNAL_SERVER_ERROR" || code == "SERVER_ERROR"
+        }
+        return false
+    }
+    
+    /// 判定是否属于 HTTP 429 限流
+    public var isRateLimited: Bool {
+        if case .apiError(let code, _) = self {
+            return code == "HTTP_429" || code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS"
+        }
+        return false
+    }
+    
+    /// 判定是否属于服务端明确的业务拒绝 (已吊销/已删除/席位超限)
+    public var isExplicitBusinessRejection: Bool {
+        switch self {
+        case .maxMachinesReached:
+            return true
+        case .apiError(let code, _):
+            let rejections: Set<String> = [
+                "LICENSE_NOT_FOUND",
+                "LICENSE_REVOKED",
+                "LICENSE_SUSPENDED",
+                "MACHINE_REVOKED",
+                "MACHINE_DEACTIVATED",
+                "MAX_MACHINES_REACHED",
+                "HTTP_404",
+                "HTTP_403",
+                "HTTP_422"
+            ]
+            return rejections.contains(code)
+        default:
+            return false
+        }
+    }
+    
+    /// 判定是否属于通常可自动重试的临时故障 (网络异常、5xx 错误、429 限流)
+    public var isRecoverable: Bool {
+        switch self {
+        case .networkError:
+            return true
+        case .apiError:
+            return isServerError || isRateLimited
+        default:
+            return false
+        }
+    }
 }
+

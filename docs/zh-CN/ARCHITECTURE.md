@@ -204,3 +204,10 @@ Header.Payload.Signature
    - macOS 专有的 `import IOKit` 严格封闭在 `#if os(macOS)` 内；
    - 二期扩展 iOS 时，只需补充实现 `#if os(iOS)` 的 `IOSFingerprintProvider`（基于 `UIDevice.current.identifierForVendor` + Keychain 设备标识）；
    - 核心验签（CryptoKit）、状态机（LicenseStatus）、API 网络客户端（URLSession）等公共逻辑 100% 共享，实现无缝演进。
+
+---
+
+## 5. 高可用与容灾降级架构
+
+有关面对网络不稳定、服务端 5xx、网关 404 等极端场景下的具体容灾矩阵、离线宽限期判定、防惊群退避算法与详细落地规范，请参阅专门文档：
+* 📖 [**LicenKit 客户端高可用与异常容灾架构设计规范**](FAULT_TOLERANCE_AND_DISASTER_RECOVERY.md)

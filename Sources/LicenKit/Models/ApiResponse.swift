@@ -213,6 +213,20 @@ public struct ValidationResult: Sendable {
     public let tokenExpiresAt: Date?
     public let licenseExpiresAt: Date?
     public let reason: String?
+    
+    public init(
+        valid: Bool,
+        token: String? = nil,
+        tokenExpiresAt: Date? = nil,
+        licenseExpiresAt: Date? = nil,
+        reason: String? = nil
+    ) {
+        self.valid = valid
+        self.token = token
+        self.tokenExpiresAt = tokenExpiresAt
+        self.licenseExpiresAt = licenseExpiresAt
+        self.reason = reason
+    }
 }
 
 // MARK: - Trial

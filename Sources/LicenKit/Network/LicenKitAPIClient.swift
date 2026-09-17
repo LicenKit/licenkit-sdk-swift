@@ -7,14 +7,22 @@ public struct LicenKitAPIClient: Sendable {
     public let timeoutInterval: TimeInterval
     private let urlSession: URLSession
     
-    public init(serverUrl: String, timeoutInterval: TimeInterval = 15.0) {
+    public init(
+        serverUrl: String,
+        timeoutInterval: TimeInterval = 15.0,
+        urlSession: URLSession? = nil
+    ) {
         self.serverUrl = serverUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.timeoutInterval = timeoutInterval
         
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = timeoutInterval
-        sessionConfig.timeoutIntervalForResource = timeoutInterval
-        self.urlSession = URLSession(configuration: sessionConfig)
+        if let session = urlSession {
+            self.urlSession = session
+        } else {
+            let sessionConfig = URLSessionConfiguration.default
+            sessionConfig.timeoutIntervalForRequest = timeoutInterval
+            sessionConfig.timeoutIntervalForResource = timeoutInterval
+            self.urlSession = URLSession(configuration: sessionConfig)
+        }
     }
     
     // MARK: - API Calls
@@ -135,11 +143,21 @@ public struct LicenKitAPIClient: Sendable {
         }
         
         if !apiResponse.success || apiResponse.data == nil {
-            let code = apiResponse.error?.code ?? "API_ERROR"
+            let serverCode = apiResponse.error?.code
             let message = apiResponse.error?.message ?? "Server rejected request"
-            if code == "MAX_MACHINES_REACHED" {
+            if serverCode == "MAX_MACHINES_REACHED" || httpResponse.statusCode == 409 {
                 throw LicenKitError.maxMachinesReached
             }
+            
+            let code: String
+            if httpResponse.statusCode >= 500 {
+                code = "HTTP_\(httpResponse.statusCode)"
+            } else if httpResponse.statusCode == 429 {
+                code = "HTTP_429"
+            } else {
+                code = serverCode ?? "HTTP_\(httpResponse.statusCode)"
+            }
+            
             throw LicenKitError.apiError(code: code, message: message)
         }
         

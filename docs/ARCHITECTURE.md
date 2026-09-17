@@ -203,3 +203,10 @@ The SDK architecture is designed for multi-platform readiness:
    - macOS-specific `import IOKit` is contained strictly within `#if os(macOS)`;
    - Future iOS extensions implement `IOSFingerprintProvider` using `UIDevice.current.identifierForVendor` and Keychain UUID;
    - Crypto, models, network client, and licensing state machines are 100% platform-agnostic and shared across all targets.
+
+---
+
+## 5. High Availability & Disaster Recovery Architecture
+
+For detailed specifications on fault taxonomy (HTTP 404, 5xx, network loss), multi-tier offline grace periods, jittered exponential backoff, and transparent fallback mechanisms, please refer to:
+* 📖 [**LicenKit Client High Availability & Disaster Recovery Specification**](FAULT_TOLERANCE_AND_DISASTER_RECOVERY.md)
