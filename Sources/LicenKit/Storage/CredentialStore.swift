@@ -3,6 +3,7 @@ import Foundation
 /// 客户端本地持久化凭据模型
 public struct StoredCredentials: Codable, Sendable {
     public let licenseKey: String
+    public let machineToken: String
     public let token: String
     public let lastValidatedAt: Date
     public let offlineGracePeriod: Int
@@ -11,7 +12,8 @@ public struct StoredCredentials: Codable, Sendable {
     public let isTrial: Bool
     
     public init(
-        licenseKey: String,
+        licenseKey: String = "",
+        machineToken: String = "",
         token: String,
         lastValidatedAt: Date,
         offlineGracePeriod: Int,
@@ -20,6 +22,7 @@ public struct StoredCredentials: Codable, Sendable {
         isTrial: Bool = false
     ) {
         self.licenseKey = licenseKey
+        self.machineToken = machineToken
         self.token = token
         self.lastValidatedAt = lastValidatedAt
         self.offlineGracePeriod = offlineGracePeriod
@@ -30,6 +33,7 @@ public struct StoredCredentials: Codable, Sendable {
     
     enum CodingKeys: String, CodingKey {
         case licenseKey
+        case machineToken
         case token
         case lastValidatedAt
         case offlineGracePeriod
@@ -41,6 +45,7 @@ public struct StoredCredentials: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.licenseKey = try container.decodeIfPresent(String.self, forKey: .licenseKey) ?? ""
+        self.machineToken = try container.decodeIfPresent(String.self, forKey: .machineToken) ?? ""
         self.token = try container.decode(String.self, forKey: .token)
         self.lastValidatedAt = try container.decode(Date.self, forKey: .lastValidatedAt)
         self.offlineGracePeriod = try container.decodeIfPresent(Int.self, forKey: .offlineGracePeriod) ?? 0

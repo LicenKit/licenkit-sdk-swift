@@ -229,8 +229,10 @@ public final class LicenKit: @unchecked Sendable {
         )
         
         // 持久化到 Keychain (按当前机器指纹隔离保存，防止多设备 iCloud 同步冲突)
+        // 遵循双凭据架构：本地磁盘不保留激活码明文，仅持久化 machineToken 与 machineId
         let creds = StoredCredentials(
-            licenseKey: licenseKey,
+            licenseKey: "",
+            machineToken: response.machineToken ?? "",
             token: token,
             lastValidatedAt: Date(),
             offlineGracePeriod: response.policy.offlineGracePeriod,
@@ -328,6 +330,7 @@ public final class LicenKit: @unchecked Sendable {
                 let updatedToken = trialResponse.token ?? creds.token
                 let updatedCreds = StoredCredentials(
                     licenseKey: creds.licenseKey,
+                    machineToken: creds.machineToken,
                     token: updatedToken,
                     lastValidatedAt: Date(),
                     offlineGracePeriod: creds.offlineGracePeriod,
@@ -347,7 +350,8 @@ public final class LicenKit: @unchecked Sendable {
             } else {
                 let request = ApiValidateRequest(
                     accountId: configuration.accountId,
-                    licenseKey: creds.licenseKey,
+                    machineId: creds.machineId,
+                    machineToken: creds.machineToken,
                     fingerprint: fingerprint
                 )
                 
@@ -377,6 +381,7 @@ public final class LicenKit: @unchecked Sendable {
                 
                 let updatedCreds = StoredCredentials(
                     licenseKey: creds.licenseKey,
+                    machineToken: creds.machineToken,
                     token: updatedToken,
                     lastValidatedAt: Date(),
                     offlineGracePeriod: creds.offlineGracePeriod,
@@ -457,10 +462,11 @@ public final class LicenKit: @unchecked Sendable {
             setCachedStatus(.untrusted(reason: "Deactivated"))
         }
         
-        if let creds = savedCreds, let fp = fingerprint, !creds.isTrial, !creds.licenseKey.isEmpty {
+        if let creds = savedCreds, let fp = fingerprint, !creds.isTrial, (!creds.machineToken.isEmpty || !creds.machineId.isEmpty) {
             let request = ApiDeactivateRequest(
                 accountId: configuration.accountId,
-                licenseKey: creds.licenseKey,
+                machineId: creds.machineId,
+                machineToken: creds.machineToken,
                 fingerprint: fp
             )
             _ = try? await apiClient.deactivate(request: request)

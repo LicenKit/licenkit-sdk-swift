@@ -17,7 +17,8 @@ public struct OfflineTokenHeader: Codable, Equatable, Sendable {
 public struct LicenseClaims: Codable, Equatable, Sendable {
     public let typ: String
     public let licenseId: String
-    public let licenseKey: String
+    public let sub: String
+    public var licenseKey: String { sub }
     public let accountId: String
     public let productId: String
     public let policyId: String
@@ -29,7 +30,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case typ
         case licenseId = "lic_id"
-        case licenseKey = "sub"
+        case sub
         case accountId = "acc"
         case productId = "prd"
         case policyId = "pol"
@@ -54,7 +55,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public init(
         typ: String = "license",
         licenseId: String,
-        licenseKey: String,
+        sub: String,
         accountId: String,
         productId: String,
         policyId: String,
@@ -65,7 +66,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     ) {
         self.typ = typ
         self.licenseId = licenseId
-        self.licenseKey = licenseKey
+        self.sub = sub
         self.accountId = accountId
         self.productId = productId
         self.policyId = policyId
@@ -73,6 +74,32 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         self.issuedAtTimestamp = issuedAtTimestamp
         self.expirationTimestamp = expirationTimestamp
         self.features = features
+    }
+
+    public init(
+        typ: String = "license",
+        licenseId: String,
+        licenseKey: String,
+        accountId: String,
+        productId: String,
+        policyId: String,
+        fingerprint: String,
+        issuedAtTimestamp: Int64,
+        expirationTimestamp: Int64,
+        features: [String] = []
+    ) {
+        self.init(
+            typ: typ,
+            licenseId: licenseId,
+            sub: licenseKey,
+            accountId: accountId,
+            productId: productId,
+            policyId: policyId,
+            fingerprint: fingerprint,
+            issuedAtTimestamp: issuedAtTimestamp,
+            expirationTimestamp: expirationTimestamp,
+            features: features
+        )
     }
 }
 

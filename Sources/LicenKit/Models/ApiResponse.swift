@@ -105,6 +105,7 @@ public struct ApiActivateResponse: Codable, Sendable {
     public let activated: Bool
     public let reused: Bool
     public let machineId: String
+    public let machineToken: String?
     public let scheme: String
     public let token: String?
     public let tokenExpiresAt: FlexibleDate?
@@ -117,6 +118,7 @@ public struct ApiActivateResponse: Codable, Sendable {
         case activated
         case reused
         case machineId = "machine_id"
+        case machineToken = "machine_token"
         case scheme
         case token
         case tokenExpiresAt = "token_expires_at"
@@ -131,12 +133,26 @@ public struct ApiActivateResponse: Codable, Sendable {
 
 public struct ApiValidateRequest: Codable, Sendable {
     public let accountId: String
-    public let licenseKey: String
+    public let machineId: String
+    public let machineToken: String
     public let fingerprint: String
+    
+    public init(
+        accountId: String,
+        machineId: String,
+        machineToken: String,
+        fingerprint: String
+    ) {
+        self.accountId = accountId
+        self.machineId = machineId
+        self.machineToken = machineToken
+        self.fingerprint = fingerprint
+    }
     
     enum CodingKeys: String, CodingKey {
         case accountId = "account_id"
-        case licenseKey = "license_key"
+        case machineId = "machine_id"
+        case machineToken = "machine_token"
         case fingerprint
     }
 }
@@ -171,12 +187,26 @@ public struct ApiValidateResponse: Codable, Sendable {
 
 public struct ApiDeactivateRequest: Codable, Sendable {
     public let accountId: String
-    public let licenseKey: String
+    public let machineId: String
+    public let machineToken: String
     public let fingerprint: String
+    
+    public init(
+        accountId: String,
+        machineId: String,
+        machineToken: String,
+        fingerprint: String
+    ) {
+        self.accountId = accountId
+        self.machineId = machineId
+        self.machineToken = machineToken
+        self.fingerprint = fingerprint
+    }
     
     enum CodingKeys: String, CodingKey {
         case accountId = "account_id"
-        case licenseKey = "license_key"
+        case machineId = "machine_id"
+        case machineToken = "machine_token"
         case fingerprint
     }
 }

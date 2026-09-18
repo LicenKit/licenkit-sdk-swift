@@ -297,4 +297,105 @@ final class TokenEvaluationTests: XCTestCase {
         XCTAssertEqual(response.licenseExpiresAt?.date?.timeIntervalSince1970, 1789646400)
         XCTAssertEqual(response.lastHeartbeatAt?.date?.timeIntervalSince1970, 1726574400)
     }
+    
+    func testApiActivateResponseMachineTokenDecoding() throws {
+        let json = """
+        {
+            "activated": true,
+            "reused": false,
+            "machine_id": "mac_999",
+            "machine_token": "mct_abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "scheme": "ed25519",
+            "policy": {
+                "name": "Pro Tier",
+                "max_machines": 3,
+                "offline_grace_period": 86400,
+                "features": ["ai", "sync"]
+            }
+        }
+        """.data(using: .utf8)!
+        
+        let response = try JSONDecoder().decode(ApiActivateResponse.self, from: json)
+        XCTAssertTrue(response.activated)
+        XCTAssertEqual(response.machineId, "mac_999")
+        XCTAssertEqual(response.machineToken, "mct_abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+    }
+    
+    func testApiValidateRequestEncoding() throws {
+        let req = ApiValidateRequest(
+            accountId: "acc_demo",
+            machineId: "mac_01",
+            machineToken: "mct_secret_token_123",
+            fingerprint: "fp_hardware_abc"
+        )
+        let data = try JSONEncoder().encode(req)
+        let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        
+        XCTAssertEqual(dict?["account_id"] as? String, "acc_demo")
+        XCTAssertEqual(dict?["machine_id"] as? String, "mac_01")
+        XCTAssertEqual(dict?["machine_token"] as? String, "mct_secret_token_123")
+        XCTAssertEqual(dict?["fingerprint"] as? String, "fp_hardware_abc")
+        XCTAssertNil(dict?["license_key"])
+    }
+    
+    func testApiDeactivateRequestEncoding() throws {
+        let req = ApiDeactivateRequest(
+            accountId: "acc_demo",
+            machineId: "mac_01",
+            machineToken: "mct_secret_token_123",
+            fingerprint: "fp_hardware_abc"
+        )
+        let data = try JSONEncoder().encode(req)
+        let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        
+        XCTAssertEqual(dict?["account_id"] as? String, "acc_demo")
+        XCTAssertEqual(dict?["machine_id"] as? String, "mac_01")
+        XCTAssertEqual(dict?["machine_token"] as? String, "mct_secret_token_123")
+        XCTAssertEqual(dict?["fingerprint"] as? String, "fp_hardware_abc")
+        XCTAssertNil(dict?["license_key"])
+    }
+    
+    func testStoredCredentialsMachineTokenPersistence() throws {
+        let now = Date()
+        let creds = StoredCredentials(
+            licenseKey: "",
+            machineToken: "mct_persisted_token",
+            token: "sample.jwt.token",
+            lastValidatedAt: now,
+            offlineGracePeriod: 604800,
+            policyFeatures: ["featureA"],
+            machineId: "mac_persisted",
+            isTrial: false
+        )
+        let data = try JSONEncoder().encode(creds)
+        let decoded = try JSONDecoder().decode(StoredCredentials.self, from: data)
+        
+        XCTAssertEqual(decoded.licenseKey, "")
+        XCTAssertEqual(decoded.machineToken, "mct_persisted_token")
+        XCTAssertEqual(decoded.machineId, "mac_persisted")
+        XCTAssertEqual(decoded.token, "sample.jwt.token")
+        XCTAssertFalse(decoded.isTrial)
+    }
+    
+    func testLicenseClaimsSubAndAlias() throws {
+        let json = """
+        {
+            "typ": "license",
+            "lic_id": "lic_99999",
+            "sub": "lic_99999",
+            "acc": "acc_demo",
+            "prd": "prd_demo",
+            "pol": "pol_demo",
+            "fp": "fp_test",
+            "iat": 1726574400,
+            "exp": 1758110400,
+            "fea": ["export"]
+        }
+        """.data(using: .utf8)!
+        
+        let claims = try JSONDecoder().decode(LicenseClaims.self, from: json)
+        XCTAssertEqual(claims.licenseId, "lic_99999")
+        XCTAssertEqual(claims.sub, "lic_99999")
+        XCTAssertEqual(claims.licenseKey, "lic_99999")
+    }
 }
