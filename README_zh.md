@@ -34,7 +34,7 @@
    ```text
    https://github.com/LicenKit/licenkit-sdk-swift.git
    ```
-3. 选择版本规则（推荐：*Up to Next Major Version*），并将 `LicenKit` 添加到您的 macOS App Target 中。
+3. 选择版本规则（推荐：*Up to Next Major Version*，从 `0.2.0` 起），并将 `LicenKit` 添加到您的 macOS App Target 中。
 
 或者在您的 `Package.swift` 中声明依赖：
 
@@ -48,7 +48,7 @@ let package = Package(
         .macOS(.v12)
     ],
     dependencies: [
-        .package(url: "https://github.com/LicenKit/licenkit-sdk-swift.git", from: "0.1.0")
+        .package(url: "https://github.com/LicenKit/licenkit-sdk-swift.git", from: "0.2.0")
     ],
     targets: [
         .target(

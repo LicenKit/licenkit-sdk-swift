@@ -93,6 +93,17 @@ public func validate() async throws -> ValidationResult
 
 ---
 
+#### `refresh() async throws -> ValidationResult`
+前台主动刷新授权（供用户在界面点击【刷新授权】或【检查续费】时调用）。
+
+```swift
+public func refresh() async throws -> ValidationResult
+```
+- **返回值**：`ValidationResult`，包含探活结论、最新 Token 与过期时间。
+- **说明**：重置当前 Session 熔断状态，并采用前台重试策略（`foregroundActivation` 最多 3 次指数退避）。若成功则持久化新 Token 并恢复正常状态；若网络故障或服务端异常，直接抛出异常供界面弹窗或 Toast 提示，主状态继续维持不变。
+
+---
+
 #### `deactivate() async throws`
 向服务端释放当前设备绑定的席位，并原子清空本地 Keychain 中的授权凭据。
 

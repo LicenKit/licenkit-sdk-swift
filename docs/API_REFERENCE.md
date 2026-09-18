@@ -93,6 +93,17 @@ public func validate() async throws -> ValidationResult
 
 ---
 
+#### `refresh() async throws -> ValidationResult`
+Actively renews license authorization in foreground when initiated by the user (e.g. tapping "Refresh License" or "Check Renewal" in settings or dialogs).
+
+```swift
+public func refresh() async throws -> ValidationResult
+```
+- **Returns**: `ValidationResult`, containing probe validation status, refreshed token, and expiration dates.
+- **Description**: Resets the current session circuit breaker and applies the foreground retry policy (`foregroundActivation`). If the network is unreachable or server errors occur, throws an error immediately so the UI can prompt the user (e.g. via alert or toast), while preserving local valid status.
+
+---
+
 #### `deactivate() async throws`
 Releases the current machine seat on the server and clears credentials from the local Keychain.
 

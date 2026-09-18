@@ -34,7 +34,7 @@ In your Xcode project:
    ```text
    https://github.com/LicenKit/licenkit-sdk-swift.git
    ```
-3. Set the Dependency Rule (recommended: *Up to Next Major Version* from `0.1.0`), and add `LicenKit` to your macOS App Target.
+3. Set the Dependency Rule (recommended: *Up to Next Major Version* from `0.2.0`), and add `LicenKit` to your macOS App Target.
 
 Or declare it directly in your `Package.swift`:
 
@@ -48,7 +48,7 @@ let package = Package(
         .macOS(.v12)
     ],
     dependencies: [
-        .package(url: "https://github.com/LicenKit/licenkit-sdk-swift.git", from: "0.1.0")
+        .package(url: "https://github.com/LicenKit/licenkit-sdk-swift.git", from: "0.2.0")
     ],
     targets: [
         .target(
