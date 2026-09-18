@@ -13,7 +13,7 @@ public struct KeychainStore: CredentialStore, Sendable {
     public init(
         productId: String,
         accessGroup: String? = nil,
-        isSynchronizable: Bool = true
+        isSynchronizable: Bool = false
     ) {
         self.service = "com.licenkit.client.\(productId)"
         self.accessGroup = accessGroup
@@ -121,6 +121,18 @@ public struct KeychainStore: CredentialStore, Sendable {
             newItem[kSecValueData as String] = data
             newItem[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
             status = SecItemAdd(newItem as CFDictionary, nil)
+            
+            // 降级兜底：若因宿主 App 缺少 iCloud Keychain 权限导致 -34018 或 -50，自动回退到本地无同步重试
+            if status != errSecSuccess && isSynchronizable {
+                var fallbackItem = newItem
+                fallbackItem[kSecAttrSynchronizable as String] = kCFBooleanFalse as Any
+                status = SecItemAdd(fallbackItem as CFDictionary, nil)
+            }
+        } else if status != errSecSuccess && isSynchronizable {
+            // Update 同样提供非同步降级
+            var fallbackQuery = query
+            fallbackQuery[kSecAttrSynchronizable as String] = kCFBooleanFalse as Any
+            status = SecItemUpdate(fallbackQuery as CFDictionary, updateAttributes as CFDictionary)
         }
         
         guard status == errSecSuccess else {
