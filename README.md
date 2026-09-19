@@ -1,211 +1,63 @@
 # LicenKit Swift SDK
 
-**English** | [简体中文](README_zh.md)
+LicenKit Swift SDK 是面向 macOS App 的原生授权客户端。它连接 LicenKit Server，负责设备激活、在线验证、签名离线验证和 Keychain 凭据管理。
 
-> Modern, lightweight, high-performance native Swift SDK for [LicenKit](https://github.com/LicenKit/licenkit) software licensing, seat activation, and offline cryptographic verification.
+> 当前仓库正在对齐 LicenKit V1 协议。本文档描述目标合同，现有代码仍存在无条件要求公钥和 Offline Token 等差距，不能把本文档视为已经完成的功能声明。
 
----
+## 两种验证模式
 
-## 🎯 Overview
+| 模式 | 服务端凭证 | SDK 是否需要公钥 | 断网能力 |
+| --- | --- | --- | --- |
+| `online` | Activation ID + Machine Token | 否 | 不能证明当前授权，只能表达缓存状态或需要联网 |
+| `signed_offline` | 以上凭证 + Ed25519 Offline Token | 是 | Token 有效期内可以离线验证 |
 
-**LicenKit Swift SDK** (`licenkit-sdk-swift`) is a native software licensing library built for Apple platforms. Starting with desktop **macOS**, it delivers an ultra-lightweight, zero-external-dependency, and highly secure licensing and trial management solution for commercial apps.
+Machine Token 是在线设备凭证，不是 Offline Token。SDK 不会把两者混为同一种授权能力。
 
-### Key Features
-
-- 🔒 **Zero External Dependencies**: Built 100% on Apple native frameworks (`Foundation`, `CryptoKit`, `Security`, `IOKit`). No third-party pods, binaries, or C-libraries, ensuring instantaneous build times, minimal footprint, and zero supply-chain security risks.
-- ⚡ **Swift Concurrency Native**: Modern asynchronous API entirely designed with `async/await`, strongly typed and thread-safe.
-- 🛡️ **Dual-Mode Verification**:
-  - **Online Heartbeat Validation**: Sub-second synchronization with LicenKit Edge Engines (Cloudflare Workers + D1) for seat activation, lease status, and revocations.
-  - **Offline Cryptographic Verification**: Zero-latency mathematical offline signature verification powered by **Ed25519** elliptic curves via CryptoKit.
-- 🎁 **Out-of-the-Box Free Trial**: Built-in silent hardware-fingerprint trial claiming (`requestTrial`), anti-abuse protection, offline `LK-TRIAL` token issuance, and seamless migration to commercial licenses upon purchase.
-- 💻 **Hardware Fingerprint Anti-Abuse**: Extracts immutable machine characteristics using macOS kernel-level `IOPlatformUUID` with deterministic SHA-256 network fallback to stop license sharing across devices.
-- 🔑 **Keychain Security & iCloud Roaming**: Stores offline license tokens and credentials securely in macOS Keychain. Supports seamless iCloud Keychain roaming to restore activations on new devices under the same Apple ID.
-- 🎛️ **Feature Entitlements**: In-memory, sub-millisecond feature flag checking to gate premium tiers and modules on demand.
-
----
-
-## 📦 Installation
-
-### Swift Package Manager (SPM)
-
-In your Xcode project:
-1. Navigate to **File** -> **Add Package Dependencies...**
-2. Enter the repository URL in the search bar:
-   ```text
-   https://github.com/LicenKit/licenkit-sdk-swift.git
-   ```
-3. Set the Dependency Rule (recommended: *Up to Next Major Version* from `0.2.0`), and add `LicenKit` to your macOS App Target.
-
-Or declare it directly in your `Package.swift`:
+## 目标配置
 
 ```swift
-// swift-tools-version: 5.9
-import PackageDescription
-
-let package = Package(
-    name: "MyMacApp",
-    platforms: [
-        .macOS(.v12)
-    ],
-    dependencies: [
-        .package(url: "https://github.com/LicenKit/licenkit-sdk-swift.git", from: "0.2.0")
-    ],
-    targets: [
-        .target(
-            name: "MyMacApp",
-            dependencies: [
-                .product(name: "LicenKit", package: "licenkit-sdk-swift")
-            ]
-        )
+let configuration = LicenKitConfiguration(
+    serverURL: URL(string: "https://license.example.com")!,
+    accountID: "acc_01...",
+    productID: "prd_01...",
+    trustedSigningKeys: [
+        "key_01...": "<Ed25519 public key>"
     ]
 )
+
+LicenKit.configure(with: configuration)
 ```
 
----
+`trustedSigningKeys` 默认为空，因此纯在线产品不需要公钥。签名离线 License 返回的 key ID 必须在该字典中存在，否则 SDK 明确返回配置错误。
 
-## 🚀 Quick Start
-
-### 1. Initialize LicenKit
-
-Configure LicenKit once during app launch (e.g. in your `NSApplicationDelegate` or `@main App` initializer):
+## 目标调用流程
 
 ```swift
-import LicenKit
-
-let config = LicenKitConfiguration(
-    serverUrl: "https://licenkit-api.yourdomain.com",
-    accountId: "acc_live_9x8a7b6c",
-    productId: "prd_macos_pro",
-    publicKey: "MCowBQYDK2VwAyEA9F7G4hH..." // 32-byte Ed25519 Public Key (Raw Base64 or SPKI)
-)
-
-// Set global shared singleton
-LicenKit.configure(with: config)
+let activation = try await LicenKit.shared.activate(licenseKey: userInput)
+let localStatus = try await LicenKit.shared.checkLocalStatus()
+let refreshedStatus = try await LicenKit.shared.validate()
 ```
 
-### 2. Verify Local License (Instantaneous Cold Start)
+- `activate` 必须联网；
+- `checkLocalStatus` 在签名离线模式下验签，在在线模式下准确表达缓存或待联网状态；
+- `validate` 使用 Activation ID、Machine Token 和设备指纹向服务端确认状态；
+- `deactivate` 只有远端解绑成功后才报告完整成功。
 
-Check the cached credentials offline with 0 network latency:
+## 本地凭据
 
-```swift
-Task {
-    do {
-        // Loads cached token from Keychain (supports both license and trial) and validates via Ed25519
-        let status = try await LicenKit.shared.verifyOffline()
-        
-        switch status {
-        case .valid(let claims):
-            print("Commercial license valid! Expires at: \(claims.expirationDate)")
-            // Unlock all full commercial features
-            
-        case .trial(let claims):
-            print("Free trial active! Expires at: \(claims.expirationDate)")
-            // Enable trial features
-            
-        case .inGracePeriod(let claims, let remainingSeconds):
-            print("In offline grace period, \(remainingSeconds) seconds remaining.")
-            // Allow app usage, and trigger a background heartbeat
-            Task { _ = try? await LicenKit.shared.validate() }
-            
-        case .expired:
-            print("License has expired. Please renew.")
-            
-        case .trialExpired:
-            print("Free trial ended. Prompt user to purchase a license.")
-            
-        case .untrusted(let reason):
-            print("Verification failed: \(reason)")
-        }
-    } catch LicenKitError.unactivated {
-        print("Device is not activated. Prompt user for license key or free trial.")
-    }
-}
-```
+SDK 在 Keychain 中保存 Activation ID、Machine Token、验证模式、可选 Offline Token 和最近验证时间。激活完成后默认不长期保存或通过 iCloud Keychain 同步注册码。
 
-### 3. Claim Free Trial (One-Click Silent Claim)
+## 文档
 
-When the user launches the app for the first time and chooses "Start Free Trial":
+- [架构与安全边界](./docs/ARCHITECTURE.md)
+- [目标 API 合同](./docs/API_REFERENCE.md)
+- [当前差距与实现计划](./docs/IMPLEMENTATION_PLAN.md)
 
-```swift
-Task {
-    do {
-        let result = try await LicenKit.shared.requestTrial()
-        if result.expired {
-            print("Trial has already expired for this device.")
-        } else {
-            print("Trial claimed successfully! Valid until: \(result.expiresAt ?? Date())")
-            // Offline token is securely saved to Keychain; next launches verify offline
-        }
-    } catch {
-        print("Failed to request trial: \(error)")
-    }
-}
-```
+服务端领域、支付和通知合同位于 LicenKit 主仓库的 `docs/` 目录。
 
-### 4. Online License Activation
+## 技术边界
 
-When the user enters a purchased license key (`LIC-XXXX-XXXX-XXXX-XXXX`):
-
-```swift
-Task {
-    do {
-        let result = try await LicenKit.shared.activate(licenseKey: "LIC-ABCD-1234-EFGH-5678")
-        print("Activation successful! Seat ID: \(result.machineId)")
-        // Keychain is automatically updated with commercial credentials and Ed25519 token
-    } catch let error as LicenKitError {
-        switch error {
-        case .maxMachinesReached:
-            print("Activation failed: seat limit reached")
-        case .networkError(let message):
-            print("Network error: \(message)")
-        case .apiError(let code, let msg):
-            print("Server rejected [\(code)]: \(msg)")
-        default:
-            print("Activation error: \(error)")
-        }
-    }
-}
-```
-
-### 5. Feature Entitlement Checks
-
-Check access to premium features defined in the policy:
-
-```swift
-if LicenKit.shared.hasFeature("pro_export_4k") {
-    // Enable 4K export feature
-} else {
-    // Disable or show upgrade prompt
-}
-```
-
-### 6. Deactivate Seat
-
-When the user unlinks the device or unregisters their license:
-
-```swift
-Task {
-    do {
-        try await LicenKit.shared.deactivate()
-        print("Seat released and local Keychain cleared successfully.")
-    } catch {
-        print("Deactivation failed: \(error)")
-    }
-}
-```
-
----
-
-## 📚 Documentation
-
-For deeper architectural details and API references, check the `docs/` folder:
-
-- 🏛️ **[Architecture & Security Model (ARCHITECTURE.md)](./docs/ARCHITECTURE.md)**: Layered architecture, dual-mode verification workflow, hardware fingerprinting mechanism, and multi-platform roadmap.
-- 🧩 **[Modules & Features Specification (MODULES_AND_FEATURES.md)](./docs/MODULES_AND_FEATURES.md)**: Technical overview of Core, Crypto, Network, Storage, and Platform components.
-- 📖 **[API Reference Manual (API_REFERENCE.md)](./docs/API_REFERENCE.md)**: Complete public classes, protocol definitions, configuration options, and error codes.
-
----
-
-## 📄 License
-
-This project is licensed under the [Apache-2.0 License](LICENSE).
+- Swift Concurrency；
+- Foundation、CryptoKit、Security、IOKit；
+- 不引入第三方网络或密码学库；
+- 首发支持 macOS，其他 Apple 平台不作为 V1 完成条件。

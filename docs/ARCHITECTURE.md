@@ -1,212 +1,115 @@
-# LicenKit Swift SDK Architecture & Security Specification
+# Swift SDK 架构与安全边界
 
-**English** | [简体中文](zh-CN/ARCHITECTURE.md)
-
-This document details the software architecture, security model, offline cryptography, and platform adaptation mechanisms of the **LicenKit Swift SDK** (`licenkit-sdk-swift`).
-
----
-
-## 1. Architectural Vision & Principles
-
-The LicenKit Swift SDK is engineered for commercial Apple platforms, adhering to these core principles:
-
-1. **Zero External Dependencies**: Built 100% on Apple system libraries (`Foundation`, `CryptoKit`, `Security`, `IOKit`). Eliminates supply chain risks, minimizes binary bloat, and guarantees full compliance with App Store guidelines.
-2. **Headless & UI-Agnostic**: Focused purely on business contracts and APIs, avoiding any tight coupling with UI frameworks (SwiftUI/AppKit), offering host applications complete aesthetic flexibility.
-3. **Dual-Mode Verification**:
-   - **0ms Cold-Start Check**: Offline Ed25519 signature and hardware fingerprint evaluation via CryptoKit with 0 network latency;
-   - **Resilient Background Heartbeats**: Silent, non-blocking online status refresh and token renewal during offline grace periods.
-4. **Seamless Free Trial**: Frictionless device-level trial claiming, issuance of offline `LK-TRIAL` tokens, and smooth upgrade transitions to commercial licenses upon purchase.
-5. **Kernel-Grade Hardware Anti-Abuse**: Leverages OS kernel-level hardware identifiers to prevent license key leaks, multi-machine cloning, and seat abuse.
-6. **Multi-Platform Preparedness**: First-phase targets macOS desktop, with modular abstractions that allow future expansion into iOS and iPadOS.
-
----
-
-## 2. System Layering
-
-The SDK is organized into high-cohesion, low-coupling layers:
+## 1. 模块
 
 ```mermaid
 flowchart TD
-    subgraph HostApp ["Host macOS Application"]
-        AppDelegate["App Lifecycle / UI / Feature Gate"]
-    end
-
-    subgraph FacadeLayer ["1. Facade API Layer"]
-        LicenKit["LicenKit (Client Entrance)"]
-        Config["LicenKitConfiguration"]
-    end
-
-    subgraph CoreBusiness ["2. Core Licensing Engine"]
-        StatusManager["LicenseStatus (valid / trial / inGracePeriod / expired)"]
-        Entitlements["FeatureEntitlementManager (Feature Gate)"]
-    end
-
-    subgraph SecurityCrypto ["3. Cryptography & Offline Verification"]
-        Ed25519Verifier["Ed25519Verifier (Native CryptoKit Verification)"]
-        ClaimsEvaluator["ClaimsEvaluator (Payload Validation)"]
-    end
-
-    subgraph PlatformLayer ["4. Platform & Hardware Abstraction"]
-        ProviderProto["DeviceFingerprintProvider (Protocol)"]
-        MacProvider["MacOSFingerprintProvider (IOPlatformUUID + Fallback)"]
-        IOSProvider["[Phase 2] IOSFingerprintProvider (IDFV / Keychain UUID)"]
-    end
-
-    subgraph NetworkLayer ["5. Network & Edge Interaction"]
-        APIClient["LicenKitAPIClient (URLSession + async/await)"]
-    end
-
-    subgraph StorageLayer ["6. Storage & Security Layer"]
-        KeychainStore["KeychainStore (macOS Keychain Isolated Storage)"]
-    end
-
-    AppDelegate --> LicenKit
-    LicenKit --> Config
-    LicenKit --> StatusManager
-    LicenKit --> Entitlements
-    StatusManager --> Ed25519Verifier
-    StatusManager --> ClaimsEvaluator
-    StatusManager --> KeychainStore
-    StatusManager --> APIClient
-    ClaimsEvaluator --> ProviderProto
-    ProviderProto -.-> MacProvider
-    ProviderProto -.-> IOSProvider
-    APIClient --> ProviderProto
+    Host[宿主 App] --> Facade[LicenKit Facade]
+    Facade --> State[License State Evaluator]
+    Facade --> Network[API Client]
+    Facade --> Storage[Credential Store]
+    State --> Crypto[Offline Token Verifier]
+    State --> Device[Fingerprint Provider]
+    Network --> Device
+    Storage --> Keychain[macOS Keychain]
 ```
 
----
+- **Facade**：公开 async API，不包含 UI；
+- **State Evaluator**：组合本地凭据、时间和服务端结果；
+- **API Client**：激活、验证和解绑；
+- **Offline Token Verifier**：只处理 `signed_offline`；
+- **Credential Store**：保存设备凭据，不保存服务端 Secret；
+- **Fingerprint Provider**：提供稳定设备指纹。
 
-## 3. Core Mechanisms
+## 2. 信任模型
 
-### 3.1 Dual-Mode Verification Workflow
+### 在线模式
 
-LicenKit combines offline cryptographic checks with edge synchronization:
+授权事实来自一次成功的 HTTPS 服务端验证。Machine Token 只证明调用方持有该 Activation 的随机凭证，本身不包含可离线验证的权益。
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Host App
-    participant SDK as LicenKit SDK
-    participant KC as macOS Keychain
-    participant Server as LicenKit Server (Edge)
+网络不可用时，SDK可以返回最近验证时间和缓存条款，但不能返回“离线验签成功”。宿主 App 是否短时间继续运行，需要显式配置或自行判断。
 
-    Note over App, Server: Flow A: Cold Launch (Instant Offline Verification)
-    App->>SDK: verifyOffline()
-    SDK->>KC: Read cached token (License / Trial)
-    alt No credentials stored
-        SDK-->>App: throw LicenKitError.unactivated
-    else Credentials present
-        SDK->>SDK: Verify Ed25519 signature (CryptoKit)
-        SDK->>SDK: Match hardware fingerprint
-        SDK->>SDK: Check expiration date & grace period
-        alt Valid & not expired
-            SDK-->>App: return .valid(claims) or .trial(claims)
-        else In offline grace period
-            SDK-->>App: return .inGracePeriod(claims, remainingSec)
-            Note over SDK, Server: Non-blocking silent background heartbeat
-            SDK-)Server: apiValidate(licenseKey, fingerprint)
-            Server--)SDK: Return refreshed token
-            SDK-)KC: Update Keychain cache
-        else Expired or fingerprint mismatch
-            SDK-->>App: return .expired / .trialExpired / .untrusted
-        end
-    end
+### 签名离线模式
 
-    Note over App, Server: Flow B: User enters license key (Online Activation)
-    App->>SDK: activate(licenseKey: "LIC-XXXX-...")
-    SDK->>SDK: Extract hardware fingerprint (IOPlatformUUID)
-    SDK->>Server: POST /api/v1/client/activate
-    Server-->>SDK: 200 OK (Signed token & policy)
-    SDK->>SDK: Offline self-test verification
-    SDK->>KC: Persist token, key, and policy (overwriting trial)
-    SDK-->>App: return ActivationResult(machineId, token, policy)
-```
+授权事实来自服务端私钥签名的 Offline Token。SDK 使用 App 内置的受信公钥验证：
 
-### 3.2 Offline Token Cryptography
+- Token 完整性；
+- account 和 product；
+- License 和 Activation；
+- 设备指纹；
+- Token 与 License 有效期；
+- 功能权益。
 
-Tokens follow a lightweight, standard three-part Base64URL structure:
+从授权服务运行时下载的公钥不能自动成为信任根，否则攻击者同时替换服务地址和公钥即可绕过验证。
+
+## 3. 激活状态流
+
 ```text
-Header.Payload.Signature
+unactivated
+   │ activate
+   ├── online response ─────────> validOnline
+   └── signed_offline response
+         │ verify signature
+         ├── success ───────────> validOffline
+         └── failure ───────────> untrusted / configuration error
 ```
 
-1. **Header**:
-   ```json
-   { "alg": "Ed25519", "typ": "LK-TOKEN", "kid": "key_prod_01" }
-   ```
-   (For trial tokens, `typ` is `"LK-TRIAL"`)
+服务端返回 `signed_offline` 但缺少 Token、key ID 或受信公钥时必须失败，不能降级成在线成功。
 
-2. **Payload (Claims)**:
-   - Commercial License Claims:
-     ```json
-     {
-       "typ": "license",
-       "lic_id": "lic_99a8b7c6",
-       "sub": "LIC-ABCD-1234-EFGH-5678",
-       "acc": "acc_licenkit_team",
-       "prd": "prd_mac_editor",
-       "pol": "pol_pro_lifetime",
-       "fp": "A3D16E04-209F-5BC7-99E3-4E80D6955E09",
-       "iat": 1726574400,
-       "exp": 1758110400,
-       "fea": ["4k_export", "gpu_acceleration", "batch_convert"]
-     }
-     ```
-   - Free Trial Claims:
-     ```json
-     {
-       "typ": "trial",
-       "acc": "acc_licenkit_team",
-       "prd": "prd_mac_editor",
-       "fp": "A3D16E04-209F-5BC7-99E3-4E80D6955E09",
-       "iat": 1726574400,
-       "exp": 1727784000,
-       "fea": ["4k_export", "gpu_acceleration"]
-     }
-     ```
+## 4. 本地检查
 
-3. **Signature**:
-   - 64-byte Ed25519 signature generated by the server's private key over `HeaderB64Url.PayloadB64Url`.
-   - Verified locally using `CryptoKit.Curve25519.Signing.PublicKey`.
+`checkLocalStatus` 按本地凭据中的 verification mode 分支：
 
-### 3.3 macOS Hardware Fingerprinting & Anti-Abuse
+- 在线模式：读取最近在线状态，返回 `validOnline`、`temporarilyUnverified` 或 `onlineValidationRequired`；
+- 签名离线模式：验证 Offline Token，返回 `validOffline`、`expired` 或 `untrusted`。
 
-1. **Primary Path (Kernel IOKit Query)**:
-   - Queries `IOPlatformExpertDevice` via CoreFoundation / IOKit C APIs;
-   - Retrieves `kIOPlatformUUIDKey` (motherboard hardware UUID);
-   - Zero-overhead, no sub-process invocation, stable across OS updates.
-2. **Deterministic Fallback**:
-   - In sandboxed environments where `IOPlatformUUID` is restricted, enumerates physical network interface MAC addresses and hostname;
-   - Computes a deterministic SHA-256 hash as an immutable device fingerprint.
+SDK 不使用一个统一的 `verifyOffline` 名称覆盖两种模式，因为在线凭据不具备离线验证能力。
 
-### 3.4 Keychain Credential Storage
+## 5. 凭据存储
 
-- **No Plaintext Files**: Never saves activation keys or tokens in `UserDefaults` or plaintext plists.
-- **Keychain Isolation**:
-  - Based on `kSecClassGenericPassword`;
-  - Service scoped to `com.licenkit.client.<productId>`;
-  - Accessible attribute `kSecAttrAccessibleAfterFirstUnlock` for background Daemons;
-  - Supports iCloud Keychain roaming for seamless multi-device activation under the same Apple ID.
+Keychain 记录按 account + product + fingerprint 隔离：
 
----
+- Activation ID；
+- Machine Token；
+- verification mode；
+- Offline Token，可为空；
+- last validated at；
+- 缓存权益摘要。
 
-## 4. Multi-Platform Extensibility (macOS -> iOS)
+注册码用于建立 Activation，成功后默认丢弃。它不写入普通文件、UserDefaults 或 iCloud Keychain。
 
-The SDK architecture is designed for multi-platform readiness:
+## 6. 密钥轮换
 
-1. **Protocol Abstraction**:
-   ```swift
-   public protocol DeviceFingerprintProvider: Sendable {
-       func getFingerprint() async throws -> String
-   }
-   ```
-2. **Compile-time Isolation**:
-   - macOS-specific `import IOKit` is contained strictly within `#if os(macOS)`;
-   - Future iOS extensions implement `IOSFingerprintProvider` using `UIDevice.current.identifierForVendor` and Keychain UUID;
-   - Crypto, models, network client, and licensing state machines are 100% platform-agnostic and shared across all targets.
+SDK 接受 key ID 到公钥的集合：
 
----
+- 新 Token 使用 active key；
+- 未过期旧 Token 可以继续由 retired key 验证；
+- revoked key 应导致对应 Token 不再受信；
+- 移除旧公钥前必须确保所有由它签发的 Token 已经过期。
 
-## 5. High Availability & Disaster Recovery Architecture
+## 7. 网络与错误
 
-For detailed specifications on fault taxonomy (HTTP 404, 5xx, network loss), multi-tier offline grace periods, jittered exponential backoff, and transparent fallback mechanisms, please refer to:
-* 📖 [**LicenKit Client High Availability & Disaster Recovery Specification**](FAULT_TOLERANCE_AND_DISASTER_RECOVERY.md)
+网络失败、服务端 5xx 和业务拒绝分开表达：
+
+- 网络失败不等于 License revoked；
+- `LICENSE_SUSPENDED`、`LICENSE_EXPIRED`、`ACTIVATION_REVOKED` 等业务码进入对应状态；
+- 未知服务端错误保留 code、message、details 和 request ID；
+- Keychain OSStatus、签名错误和 JSON 解码错误保留原始诊断。
+
+## 8. 解绑
+
+解绑先调用远端，再清理本地凭据：
+
+1. 服务端成功：清理本地，返回 completed；
+2. 服务端明确表示 Activation 已不存在：视为幂等成功，清理本地；
+3. 网络或服务端暂时失败：保留凭据并返回 remote failure；
+4. 宿主 App 如果提供“仅清理本地”操作，必须使用不同名称并说明远端席位可能仍被占用。
+
+## 9. 不在 SDK 内实现
+
+- 支付和订阅管理；
+- 注册码邮件找回；
+- 管理控制台；
+- License Terms 迁移；
+- 隐式 UI 弹窗；
+- 自动信任运行时下载的公钥。
