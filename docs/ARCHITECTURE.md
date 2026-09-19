@@ -1,115 +1,58 @@
 # Swift SDK 架构与安全边界
 
-## 1. 模块
+## 模块职责
 
-```mermaid
-flowchart TD
-    Host[宿主 App] --> Facade[LicenKit Facade]
-    Facade --> State[License State Evaluator]
-    Facade --> Network[API Client]
-    Facade --> Storage[Credential Store]
-    State --> Crypto[Offline Token Verifier]
-    State --> Device[Fingerprint Provider]
-    Network --> Device
-    Storage --> Keychain[macOS Keychain]
-```
+- `LicenKit`：统一组织激活、校验、解绑和 Trial，不包含 UI；
+- `LicenKitAPIClient`：实现 V1 JSON Envelope，区分传输错误与业务错误；
+- `Ed25519Verifier`：只验证 `signed` 模式的紧凑 JWS；
+- `ClaimsEvaluator`：核对 Account、Product、Activation、设备、时间和 Product Release；
+- `KeychainStore`：按 Product 与设备指纹保存 License/Trial 凭据；
+- `MacOSFingerprintProvider`：保持现有 IOKit 设备指纹实现。
 
-- **Facade**：公开 async API，不包含 UI；
-- **State Evaluator**：组合本地凭据、时间和服务端结果；
-- **API Client**：激活、验证和解绑；
-- **Offline Token Verifier**：只处理 `signed_offline`；
-- **Credential Store**：保存设备凭据，不保存服务端 Secret；
-- **Fingerprint Provider**：提供稳定设备指纹。
+## 凭证信任模型
 
-## 2. 信任模型
-
-### 在线模式
-
-授权事实来自一次成功的 HTTPS 服务端验证。Machine Token 只证明调用方持有该 Activation 的随机凭证，本身不包含可离线验证的权益。
-
-网络不可用时，SDK可以返回最近验证时间和缓存条款，但不能返回“离线验签成功”。宿主 App 是否短时间继续运行，需要显式配置或自行判断。
-
-### 签名离线模式
-
-授权事实来自服务端私钥签名的 Offline Token。SDK 使用 App 内置的受信公钥验证：
-
-- Token 完整性；
-- account 和 product；
-- License 和 Activation；
-- 设备指纹；
-- Token 与 License 有效期；
-- 功能权益。
-
-从授权服务运行时下载的公钥不能自动成为信任根，否则攻击者同时替换服务地址和公钥即可绕过验证。
-
-## 3. 激活状态流
+`opaque` 与 `signed` 共享在线协议和 Machine Token。差异只在 `signed` 额外返回 Signed License Token：
 
 ```text
-unactivated
-   │ activate
-   ├── online response ─────────> validOnline
-   └── signed_offline response
-         │ verify signature
-         ├── success ───────────> validOffline
-         └── failure ───────────> untrusted / configuration error
+activate / validate
+  ├─ opaque -> 保存在线凭据 -> validOnline
+  └─ signed -> 查找内置 kid -> Ed25519 验签 -> Claims/Release 检查 -> 保存 -> validOnline
 ```
 
-服务端返回 `signed_offline` 但缺少 Token、key ID 或受信公钥时必须失败，不能降级成在线成功。
+本地检查：
 
-## 4. 本地检查
+```text
+stored credential
+  ├─ opaque -> temporarilyUnverified (isUsable=false)
+  ├─ signed -> validLocally / expired / updateEntitlementRequired / untrusted
+  └─ trial  -> onlineValidationRequired
+```
 
-`checkLocalStatus` 按本地凭据中的 verification mode 分支：
+运行时从授权服务下载的公钥不能成为信任根。密钥轮换通过 App 同时内置新旧 key ID 实现；服务端撤销密钥不能瞬间改变完全离线设备上的旧 Token，风险窗口由 Token TTL 和受信 App 更新共同限制。
 
-- 在线模式：读取最近在线状态，返回 `validOnline`、`temporarilyUnverified` 或 `onlineValidationRequired`；
-- 签名离线模式：验证 Offline Token，返回 `validOffline`、`expired` 或 `untrusted`。
+## Release 资格
 
-SDK 不使用一个统一的 `verifyOffline` 名称覆盖两种模式，因为在线凭据不具备离线验证能力。
+SDK 配置中的 `releaseVersion` 与 `releasePlatform` 是构建常量。服务端根据两者查找 Product Release，客户端不提交 `released_at`。`signed` 模式使用签名保护的 `rel/ver/plt/rat` 再次检查：
 
-## 5. 凭据存储
+- 版本和平台必须与当前构建完全一致；
+- Token、License 到期时间分别检查；
+- 永久 License 的 `rat > upd` 返回 `updateEntitlementRequired`，不冒充 License 到期。
 
-Keychain 记录按 account + product + fingerprint 隔离：
+## Trial
 
-- Activation ID；
-- Machine Token；
-- verification mode；
-- Offline Token，可为空；
-- last validated at；
-- 缓存权益摘要。
+Trial Claim 与 License 凭据分别存储。Trial Token 只支持在线校验，不参与 Ed25519 验签；本地缓存的 `expiresAt` 只用于展示和诊断，不能成为服务端确认有效的替代品。正常 License 激活并保存后清除同设备的 Trial 凭据。
 
-注册码用于建立 Activation，成功后默认丢弃。它不写入普通文件、UserDefaults 或 iCloud Keychain。
+## 错误和脱敏
 
-## 6. 密钥轮换
+- DNS、TLS、超时、一般网络错误和 HTTP 5xx 属于传输错误；
+- 服务端 4xx 业务拒绝保留原始 code、message、request ID 和 details；
+- details 只按敏感字段名脱敏 Token、Secret、密码、注册码和 Authorization，不隐藏整个错误包；
+- 签名格式/算法/Claims 错误、缺少受信 key ID、Release 不合格、指纹失败和 Keychain OSStatus 分开表达；
+- 网络失败不会改写成 revoked、expired 或 valid。
 
-SDK 接受 key ID 到公钥的集合：
+## 解绑顺序
 
-- 新 Token 使用 active key；
-- 未过期旧 Token 可以继续由 retired key 验证；
-- revoked key 应导致对应 Token 不再受信；
-- 移除旧公钥前必须确保所有由它签发的 Token 已经过期。
-
-## 7. 网络与错误
-
-网络失败、服务端 5xx 和业务拒绝分开表达：
-
-- 网络失败不等于 License revoked；
-- `LICENSE_SUSPENDED`、`LICENSE_EXPIRED`、`ACTIVATION_REVOKED` 等业务码进入对应状态；
-- 未知服务端错误保留 code、message、details 和 request ID；
-- Keychain OSStatus、签名错误和 JSON 解码错误保留原始诊断。
-
-## 8. 解绑
-
-解绑先调用远端，再清理本地凭据：
-
-1. 服务端成功：清理本地，返回 completed；
-2. 服务端明确表示 Activation 已不存在：视为幂等成功，清理本地；
-3. 网络或服务端暂时失败：保留凭据并返回 remote failure；
-4. 宿主 App 如果提供“仅清理本地”操作，必须使用不同名称并说明远端席位可能仍被占用。
-
-## 9. 不在 SDK 内实现
-
-- 支付和订阅管理；
-- 注册码邮件找回；
-- 管理控制台；
-- License Terms 迁移；
-- 隐式 UI 弹窗；
-- 自动信任运行时下载的公钥。
+1. 从 Keychain 读取 Activation ID 与 Machine Token；
+2. 调用远端 `/deactivate`；
+3. 远端失败时返回 `.remoteFailed(localCredentialsPreserved: true, ...)`；
+4. 只有远端确认成功后清理本地凭据并返回 `.completed`。

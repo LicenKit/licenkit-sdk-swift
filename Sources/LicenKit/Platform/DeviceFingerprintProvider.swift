@@ -10,6 +10,6 @@ public protocol DeviceFingerprintProvider: Sendable {
 public struct UnsupportedPlatformFingerprintProvider: DeviceFingerprintProvider, Sendable {
     public init() {}
     public func getFingerprint() async throws -> String {
-        throw LicenKitError.cryptoError("Native hardware fingerprint extraction is not supported on this platform. Please inject a custom DeviceFingerprintProvider.")
+        throw LicenKitError.fingerprintError(reason: "Native hardware fingerprint extraction is not supported on this platform. Inject a DeviceFingerprintProvider.")
     }
 }

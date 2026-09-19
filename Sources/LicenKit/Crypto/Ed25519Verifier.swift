@@ -1,189 +1,182 @@
-import Foundation
 import CryptoKit
+import Foundation
 
-/// 纯原生 Ed25519 离线验签器与 JWT-like Base64URL Token 解析器
 public struct Ed25519Verifier: Sendable {
-    
     public init() {}
-    
-    /// 解析并离线验签三段式 License Token
-    /// - Parameters:
-    ///   - token: 形如 `header.payload.signature` 的 Base64URL 字符串
-    ///   - publicKeyInput: 32字节 Base64 公钥或标准 SPKI 文本
-    /// - Returns: 验签成功的 Header 与 Payload (Claims)
-    public func verifyAndDecodeToken<T: Decodable>(
-        token: String,
-        publicKeyInput: String
-    ) throws -> (header: OfflineTokenHeader, claims: T) {
-        let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: ".")
-        guard parts.count == 3 else {
-            throw LicenKitError.invalidToken("Malformed token format: expected 3 dot-separated segments")
+
+    public func decodeProtectedHeader(token: String) throws -> SignedLicenseTokenHeader {
+        let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, let data = decodeBase64URL(String(parts[0])) else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "expected three valid Base64URL JWS segments")
         }
-        
-        let headerPart = parts[0]
-        let payloadPart = parts[1]
-        let signaturePart = parts[2]
-        
-        let signedDataString = "\(headerPart).\(payloadPart)"
-        guard let signedData = signedDataString.data(using: .utf8) else {
-            throw LicenKitError.invalidToken("Unable to encode signed data to UTF-8")
+        try rejectDuplicateTopLevelKeys(in: data)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any] else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "protected header must be an object")
         }
-        
-        guard let signatureData = decodeBase64Url(signaturePart) else {
-            throw LicenKitError.invalidToken("Failed to decode signature from Base64URL")
+        let allowed: Set<String> = ["alg", "typ", "kid"]
+        guard Set(dictionary.keys).isSubset(of: allowed) else {
+            let unknown = Set(dictionary.keys).subtracting(allowed).sorted().joined(separator: ",")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "unsupported protected header: \(unknown)")
         }
-        
-        guard signatureData.count == 64 else {
-            throw LicenKitError.cryptoError("Invalid Ed25519 signature length: expected 64 bytes, got \(signatureData.count)")
+        let header = try JSONDecoder().decode(SignedLicenseTokenHeader.self, from: data)
+        guard header.alg == "EdDSA" else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "protected alg must be EdDSA")
         }
-        
-        // 提取 32 字节 Raw Public Key
-        let rawPublicKeyData = try extractRawEd25519PublicKey(from: publicKeyInput)
-        
-        // 构造 CryptoKit 公钥对象
-        guard let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: rawPublicKeyData) else {
-            throw LicenKitError.cryptoError("Failed to initialize CryptoKit Ed25519 public key")
+        guard header.typ == "licenkit-license+jwt" else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "protected typ must be licenkit-license+jwt")
         }
-        
-        // 执行纯离线硬件加速数学签名核验
-        let isSignatureValid = publicKey.isValidSignature(signatureData, for: signedData)
-        guard isSignatureValid else {
-            throw LicenKitError.cryptoError("Cryptographic signature verification failed (Token tampered or wrong public key)")
+        guard !header.kid.isEmpty else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "protected kid is required")
         }
-        
-        // 反序列化 Header 与 Payload
-        guard let headerData = decodeBase64Url(headerPart),
-              let header = try? JSONDecoder().decode(OfflineTokenHeader.self, from: headerData) else {
-            throw LicenKitError.invalidToken("Failed to decode or parse token header")
-        }
-        
-        guard let payloadData = decodeBase64Url(payloadPart) else {
-            throw LicenKitError.invalidToken("Failed to decode token payload bytes")
-        }
-        
-        do {
-            let claims = try JSONDecoder().decode(T.self, from: payloadData)
-            return (header, claims)
-        } catch {
-            throw LicenKitError.invalidToken("Failed to deserialize token claims: \(error.localizedDescription)")
-        }
+        return header
     }
-    
-    /// 解析并离线验签 Token，自适应识别为正式版 LicenseClaims 或试用版 TrialClaims
-    public func verifyAndDecodeAnyToken(
+
+    public func verifyAndDecodeToken(
         token: String,
-        publicKeyInput: String
-    ) throws -> (header: OfflineTokenHeader, claims: OfflineClaims) {
-        let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: ".")
+        trustedSigningKeys: [String: String]
+    ) throws -> (header: SignedLicenseTokenHeader, claims: LicenseClaims) {
+        let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3 else {
-            throw LicenKitError.invalidToken("Malformed token format: expected 3 dot-separated segments")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "expected three JWS segments")
         }
-        
-        let headerPart = parts[0]
-        let payloadPart = parts[1]
-        let signaturePart = parts[2]
-        
-        let signedDataString = "\(headerPart).\(payloadPart)"
-        guard let signedData = signedDataString.data(using: .utf8) else {
-            throw LicenKitError.invalidToken("Unable to encode signed data to UTF-8")
+        let header = try decodeProtectedHeader(token: token)
+        guard let publicKey = trustedSigningKeys[header.kid] else {
+            throw LicenKitError.missingTrustedSigningKey(keyID: header.kid)
         }
-        
-        guard let signatureData = decodeBase64Url(signaturePart) else {
-            throw LicenKitError.invalidToken("Failed to decode signature from Base64URL")
+        guard let signature = decodeBase64URL(String(parts[2])), signature.count == 64 else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "signature must be 64-byte Base64URL Ed25519 data")
         }
-        
-        guard signatureData.count == 64 else {
-            throw LicenKitError.cryptoError("Invalid Ed25519 signature length: expected 64 bytes, got \(signatureData.count)")
+        let keyData = try extractRawEd25519PublicKey(from: publicKey)
+        let verifier: Curve25519.Signing.PublicKey
+        do { verifier = try Curve25519.Signing.PublicKey(rawRepresentation: keyData) }
+        catch { throw LicenKitError.invalidSignedLicenseToken(reason: "trusted Ed25519 public key is invalid") }
+        let signedData = Data("\(parts[0]).\(parts[1])".utf8)
+        guard verifier.isValidSignature(signature, for: signedData) else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Ed25519 signature verification failed")
         }
-        
-        let rawPublicKeyData = try extractRawEd25519PublicKey(from: publicKeyInput)
-        guard let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: rawPublicKeyData) else {
-            throw LicenKitError.cryptoError("Failed to initialize CryptoKit Ed25519 public key")
+        guard let payload = decodeBase64URL(String(parts[1])) else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "payload is not valid Base64URL")
         }
-        
-        let isSignatureValid = publicKey.isValidSignature(signatureData, for: signedData)
-        guard isSignatureValid else {
-            throw LicenKitError.cryptoError("Cryptographic signature verification failed (Token tampered or wrong public key)")
+        try rejectDuplicateTopLevelKeys(in: payload)
+        let payloadObject = try JSONSerialization.jsonObject(with: payload)
+        guard let payloadDictionary = payloadObject as? [String: Any] else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "claims payload must be an object")
         }
-        
-        guard let headerData = decodeBase64Url(headerPart),
-              let header = try? JSONDecoder().decode(OfflineTokenHeader.self, from: headerData) else {
-            throw LicenKitError.invalidToken("Failed to decode or parse token header")
+        let requiredClaims: Set<String> = [
+            "lic", "act", "acc", "prd", "rel", "ver", "plt", "rat", "fp", "iat", "exp", "lexp", "upd", "fea"
+        ]
+        guard requiredClaims.isSubset(of: Set(payloadDictionary.keys)) else {
+            let missing = requiredClaims.subtracting(Set(payloadDictionary.keys)).sorted().joined(separator: ",")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "required claims are missing: \(missing)")
         }
-        
-        guard let payloadData = decodeBase64Url(payloadPart) else {
-            throw LicenKitError.invalidToken("Failed to decode token payload bytes")
+        let claims: LicenseClaims
+        do { claims = try JSONDecoder().decode(LicenseClaims.self, from: payload) }
+        catch { throw LicenKitError.invalidSignedLicenseToken(reason: "claims could not be decoded: \(error.localizedDescription)") }
+        guard claims.tokenExpiresAtTimestamp > claims.issuedAtTimestamp else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "exp must be later than iat")
         }
-        
-        struct Probe: Decodable {
-            let typ: String?
+        if let licenseExpiration = claims.licenseExpiresAtTimestamp,
+           claims.tokenExpiresAtTimestamp > licenseExpiration {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "exp cannot be later than lexp")
         }
-        let probe = try? JSONDecoder().decode(Probe.self, from: payloadData)
-        
-        if header.typ == "LK-TRIAL" || probe?.typ == "trial" {
-            do {
-                let trialClaims = try JSONDecoder().decode(TrialClaims.self, from: payloadData)
-                return (header, .trial(trialClaims))
-            } catch {
-                throw LicenKitError.invalidToken("Failed to deserialize trial claims: \(error.localizedDescription)")
-            }
-        } else {
-            do {
-                let licenseClaims = try JSONDecoder().decode(LicenseClaims.self, from: payloadData)
-                return (header, .license(licenseClaims))
-            } catch {
-                if let trialClaims = try? JSONDecoder().decode(TrialClaims.self, from: payloadData) {
-                    return (header, .trial(trialClaims))
-                }
-                throw LicenKitError.invalidToken("Failed to deserialize license claims: \(error.localizedDescription)")
-            }
-        }
+        return (header, claims)
     }
-    
-    /// 从原始 Base64 或 SPKI 格式中提取标准的 32 字节 Ed25519 公钥字节流
+
     public func extractRawEd25519PublicKey(from input: String) throws -> Data {
-        let cleanInput = input
+        let cleaned = input
             .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
             .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
-            .replacingOccurrences(of: "\r", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: " ", with: "")
-        
-        guard let keyData = Data(base64Encoded: cleanInput) else {
-            throw LicenKitError.cryptoError("Invalid Base64 format for public key")
+            .components(separatedBy: .whitespacesAndNewlines).joined()
+        guard let data = Data(base64Encoded: cleaned) else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "trusted public key is not valid Base64")
         }
-        
-        if keyData.count == 32 {
-            return keyData
-        }
-        
-        // 标准 SPKI Ed25519 ASN.1 头部为 12 字节 (302a300506032b6570032100) + 32 字节裸公钥 = 44 字节
-        if keyData.count == 44 {
-            return keyData.subdata(in: 12..<44)
-        }
-        
-        throw LicenKitError.cryptoError("Unsupported public key length: \(keyData.count) bytes (expected 32 bytes raw or 44 bytes SPKI)")
+        if data.count == 32 { return data }
+        let prefix = Data([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00])
+        if data.count == 44, data.prefix(prefix.count) == prefix { return data.suffix(32) }
+        throw LicenKitError.invalidSignedLicenseToken(reason: "trusted public key must be raw 32-byte or Ed25519 SPKI data")
     }
-    
-    /// 将 Base64URL 字符串转为 Data
-    public func decodeBase64Url(_ base64Url: String) -> Data? {
-        var base64 = base64Url
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        
-        let remainder = base64.count % 4
-        if remainder > 0 {
-            base64.append(String(repeating: "=", count: 4 - remainder))
-        }
-        
+
+    public func decodeBase64URL(_ value: String) -> Data? {
+        guard !value.isEmpty, value.unicodeScalars.allSatisfy({
+            (65...90).contains($0.value) || (97...122).contains($0.value) || (48...57).contains($0.value) || $0 == "-" || $0 == "_"
+        }) else { return nil }
+        var base64 = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
         return Data(base64Encoded: base64)
     }
-    
-    /// 将普通 Data 转为无 Padding 的 Base64URL 字符串
-    public func encodeBase64Url(_ data: Data) -> String {
-        return data.base64EncodedString()
+
+    public func encodeBase64URL(_ data: Data) -> String {
+        data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func rejectDuplicateTopLevelKeys(in data: Data) throws {
+        let bytes = Array(data)
+        var index = 0
+        func isWhitespace(_ byte: UInt8) -> Bool { byte == 0x20 || byte == 0x09 || byte == 0x0a || byte == 0x0d }
+        func skipWhitespace() { while index < bytes.count && isWhitespace(bytes[index]) { index += 1 } }
+        func scanString() throws -> String {
+            let start = index
+            index += 1
+            var escaped = false
+            while index < bytes.count {
+                let byte = bytes[index]
+                index += 1
+                if escaped { escaped = false }
+                else if byte == 0x5c { escaped = true }
+                else if byte == 0x22 {
+                    return try JSONDecoder().decode(String.self, from: Data(bytes[start..<index]))
+                }
+            }
+            throw LicenKitError.invalidSignedLicenseToken(reason: "unterminated JSON string")
+        }
+
+        skipWhitespace()
+        guard index < bytes.count, bytes[index] == 0x7b else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "token segment must be a JSON object")
+        }
+        index += 1
+        var keys = Set<String>()
+        while index < bytes.count {
+            skipWhitespace()
+            guard index < bytes.count else {
+                throw LicenKitError.invalidSignedLicenseToken(reason: "token JSON object is not closed")
+            }
+            if bytes[index] == 0x7d { return }
+            guard bytes[index] == 0x22 else {
+                throw LicenKitError.invalidSignedLicenseToken(reason: "token object key must be a string")
+            }
+            let key = try scanString()
+            guard keys.insert(key).inserted else {
+                throw LicenKitError.invalidSignedLicenseToken(reason: "duplicate token field '\(key)'")
+            }
+            skipWhitespace()
+            guard index < bytes.count, bytes[index] == 0x3a else {
+                throw LicenKitError.invalidSignedLicenseToken(reason: "token object field is missing ':'")
+            }
+            index += 1
+            var nestedDepth = 0
+            var inString = false
+            var escaped = false
+            while index < bytes.count {
+                let byte = bytes[index]
+                if inString {
+                    if escaped { escaped = false }
+                    else if byte == 0x5c { escaped = true }
+                    else if byte == 0x22 { inString = false }
+                } else if byte == 0x22 { inString = true }
+                else if byte == 0x7b || byte == 0x5b { nestedDepth += 1 }
+                else if byte == 0x7d || byte == 0x5d {
+                    if nestedDepth == 0 && byte == 0x7d { break }
+                    nestedDepth -= 1
+                } else if byte == 0x2c && nestedDepth == 0 { break }
+                index += 1
+            }
+            if index < bytes.count, bytes[index] == 0x2c { index += 1 }
+        }
+        throw LicenKitError.invalidSignedLicenseToken(reason: "token JSON object is not closed")
     }
 }

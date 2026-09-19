@@ -1,170 +1,137 @@
 import Foundation
 
-/// 与 LicenKit 服务端边缘引擎交互的网络客户端
 public struct LicenKitAPIClient: Sendable {
-    
-    public let serverUrl: String
+    public let serverURL: URL
     public let timeoutInterval: TimeInterval
     private let urlSession: URLSession
-    
-    public init(
-        serverUrl: String,
-        timeoutInterval: TimeInterval = 15.0,
-        urlSession: URLSession? = nil
-    ) {
-        self.serverUrl = serverUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+    public init(serverURL: URL, timeoutInterval: TimeInterval = 15, urlSession: URLSession? = nil) {
+        self.serverURL = serverURL
         self.timeoutInterval = timeoutInterval
-        
-        if let session = urlSession {
-            self.urlSession = session
+        if let urlSession {
+            self.urlSession = urlSession
         } else {
-            let sessionConfig = URLSessionConfiguration.default
-            sessionConfig.timeoutIntervalForRequest = timeoutInterval
-            sessionConfig.timeoutIntervalForResource = timeoutInterval
-            self.urlSession = URLSession(configuration: sessionConfig)
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = timeoutInterval
+            configuration.timeoutIntervalForResource = timeoutInterval
+            self.urlSession = URLSession(configuration: configuration)
         }
     }
-    
-    // MARK: - API Calls
-    
-    /// 向服务端请求试用认领
-    public func requestTrial(request: ApiTrialRequest) async throws -> ApiTrialResponse {
-        return try await sendRequest(
-            path: "/api/v1/client/trial",
-            method: "POST",
-            body: request
-        )
+
+    public func activate(request: APIActivateRequest) async throws -> APICredentialResponse {
+        try await send(path: "api/v1/client/activate", body: request)
     }
-    
-    /// 向服务端发起设备激活
-    public func activate(request: ApiActivateRequest) async throws -> ApiActivateResponse {
-        return try await sendRequest(
-            path: "/api/v1/client/activate",
-            method: "POST",
-            body: request
-        )
+
+    public func validate(request: APIValidateRequest) async throws -> APICredentialResponse {
+        try await send(path: "api/v1/client/validate", body: request)
     }
-    
-    /// 向服务端发起心跳探活
-    public func validate(request: ApiValidateRequest) async throws -> ApiValidateResponse {
-        return try await sendRequest(
-            path: "/api/v1/client/validate",
-            method: "POST",
-            body: request
-        )
+
+    public func deactivate(request: APIDeactivateRequest) async throws -> APIDeactivateResponse {
+        try await send(path: "api/v1/client/deactivate", body: request)
     }
-    
-    /// 向服务端发起席位解绑
-    public func deactivate(request: ApiDeactivateRequest) async throws -> ApiDeactivateResponse {
-        return try await sendRequest(
-            path: "/api/v1/client/deactivate",
-            method: "POST",
-            body: request
-        )
+
+    public func claimTrial(request: APITrialClaimRequest) async throws -> APITrialResponse {
+        try await send(path: "api/v1/client/trials/claim", body: request)
     }
-    
-    /// 查询产品活跃公钥
-    public func fetchProductPublicKey(productId: String, accountId: String) async throws -> ApiProductPublicKeyResponse {
-        var components = URLComponents(string: "\(serverUrl)/api/v1/client/products/\(productId)/pubkey")
-        components?.queryItems = [
-            URLQueryItem(name: "accountId", value: accountId)
-        ]
-        
-        guard let url = components?.url else {
-            throw LicenKitError.networkError("Failed to build product public key URL")
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("LicenKit-Swift-SDK/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
-        
-        return try await executeRequest(request)
+
+    public func validateTrial(request: APITrialValidateRequest) async throws -> APITrialResponse {
+        try await send(path: "api/v1/client/trials/validate", body: request)
     }
-    
-    // MARK: - Private Helpers
-    
-    private func sendRequest<Req: Encodable, Resp: Decodable & Sendable>(
+
+    private func send<Request: Encodable, Response: Decodable & Sendable>(
         path: String,
-        method: String,
-        body: Req
-    ) async throws -> Resp {
-        guard let url = URL(string: "\(serverUrl)\(path)") else {
-            throw LicenKitError.networkError("Invalid URL: \(serverUrl)\(path)")
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = method
+        body: Request
+    ) async throws -> Response {
+        let url = serverURL.appendingPathComponent(path)
+        var request = URLRequest(url: url, timeoutInterval: timeoutInterval)
+        request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("LicenKit-Swift-SDK/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
-        
-        do {
-            request.httpBody = try JSONEncoder().encode(body)
-        } catch {
-            throw LicenKitError.networkError("Failed to encode request body: \(error.localizedDescription)")
-        }
-        
-        return try await executeRequest(request)
+        request.setValue("LicenKit-Swift-SDK/1.0", forHTTPHeaderField: "User-Agent")
+        do { request.httpBody = try JSONEncoder().encode(body) }
+        catch { throw LicenKitError.protocolError(reason: "request encoding failed: \(error.localizedDescription)") }
+        return try await execute(request)
     }
-    
-    private func executeRequest<Resp: Decodable & Sendable>(_ request: URLRequest) async throws -> Resp {
+
+    private func execute<Response: Decodable & Sendable>(_ request: URLRequest) async throws -> Response {
         let data: Data
         let response: URLResponse
-        
-        do {
-            (data, response) = try await urlSession.data(for: request)
+        do { (data, response) = try await urlSession.data(for: request) }
+        catch let error as URLError {
+            throw LicenKitError.transportError(kind: transportKind(for: error), underlyingDescription: error.localizedDescription)
         } catch {
-            throw LicenKitError.networkError(error.localizedDescription)
+            throw LicenKitError.transportError(kind: .network, underlyingDescription: error.localizedDescription)
         }
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw LicenKitError.networkError("Invalid HTTP response")
+        guard let http = response as? HTTPURLResponse else {
+            throw LicenKitError.transportError(kind: .invalidResponse(statusCode: nil), underlyingDescription: "response was not HTTP")
         }
-        
-        // 席位超限特殊错误码
-        if httpResponse.statusCode == 409 {
-            throw LicenKitError.maxMachinesReached
+        let envelope: LicenKitAPIResponse<Response>
+        do { envelope = try JSONDecoder().decode(LicenKitAPIResponse<Response>.self, from: data) }
+        catch {
+            let kind = http.statusCode >= 500
+                ? TransportErrorKind.server(statusCode: http.statusCode, code: nil, requestID: http.value(forHTTPHeaderField: "X-Request-ID"), details: [:])
+                : .invalidResponse(statusCode: http.statusCode)
+            throw LicenKitError.transportError(kind: kind, underlyingDescription: "response JSON did not match the V1 envelope: \(error.localizedDescription)")
         }
-        
-        let decoder = JSONDecoder()
-        let apiResponse: LicenKitApiResponse<Resp>
-        do {
-            apiResponse = try decoder.decode(LicenKitApiResponse<Resp>.self, from: data)
-        } catch {
-            // 如果返回非 JSON，或者 HTTP 非 200
-            if !(200...299).contains(httpResponse.statusCode) {
-                throw LicenKitError.apiError(
-                    code: "HTTP_\(httpResponse.statusCode)",
-                    message: "Server responded with status code \(httpResponse.statusCode)"
-                )
-            }
-            throw LicenKitError.networkError("Failed to parse server response JSON: \(error.localizedDescription)")
+
+        let requestID = envelope.error?.requestID ?? http.value(forHTTPHeaderField: "X-Request-ID")
+        let details = sanitize(details: envelope.error?.details ?? [:])
+        if http.statusCode >= 500 {
+            throw LicenKitError.transportError(
+                kind: .server(statusCode: http.statusCode, code: envelope.error?.code, requestID: requestID, details: details),
+                underlyingDescription: envelope.error?.message ?? "server returned HTTP \(http.statusCode)"
+            )
         }
-        
-        if !apiResponse.success || apiResponse.data == nil {
-            let serverCode = apiResponse.error?.code
-            let message = apiResponse.error?.message ?? "Server rejected request"
-            if serverCode == "MAX_MACHINES_REACHED" || serverCode == "SEAT_LIMIT_EXCEEDED" || httpResponse.statusCode == 409 {
-                throw LicenKitError.maxMachinesReached
-            }
-            
-            let code: String
-            if httpResponse.statusCode >= 500 {
-                code = "HTTP_\(httpResponse.statusCode)"
-            } else if httpResponse.statusCode == 429 {
-                code = "HTTP_429"
-            } else {
-                code = serverCode ?? "HTTP_\(httpResponse.statusCode)"
-            }
-            
-            throw LicenKitError.apiError(code: code, message: message)
+        if !(200...299).contains(http.statusCode) || envelope.success == false {
+            throw LicenKitError.apiError(
+                code: envelope.error?.code ?? "HTTP_\(http.statusCode)",
+                message: envelope.error?.message ?? "server rejected the request",
+                requestID: requestID,
+                details: details
+            )
         }
-        
-        guard let responseData = apiResponse.data else {
-            throw LicenKitError.networkError("Missing response payload data")
+        guard envelope.success, let result = envelope.data else {
+            throw LicenKitError.transportError(
+                kind: .invalidResponse(statusCode: http.statusCode),
+                underlyingDescription: "success response did not contain data"
+            )
         }
-        
-        return responseData
+        return result
+    }
+
+    private func transportKind(for error: URLError) -> TransportErrorKind {
+        switch error.code {
+        case .timedOut: return .timeout
+        case .cannotFindHost, .dnsLookupFailed: return .dns
+        case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid, .clientCertificateRejected,
+             .clientCertificateRequired: return .tls
+        default: return .network
+        }
+    }
+
+    private func sanitize(details: [String: JSONValue]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: details.map { key, value in
+            (key, sanitizedDiagnostic(key: key, value: value))
+        })
+    }
+
+    private func sanitizedDiagnostic(key: String, value: JSONValue) -> String {
+        sanitizedValue(key: key, value: value).diagnosticString
+    }
+
+    private func sanitizedValue(key: String, value: JSONValue) -> JSONValue {
+        let sensitiveNames = ["token", "secret", "password", "license_key", "authorization"]
+        if sensitiveNames.contains(where: { key.lowercased().contains($0) }) { return .string("[REDACTED]") }
+        switch value {
+        case .object(let object):
+            return .object(Dictionary(uniqueKeysWithValues: object.map { nestedKey, nested in
+                (nestedKey, sanitizedValue(key: nestedKey, value: nested))
+            }))
+        case .array(let values):
+            return .array(values.map { sanitizedValue(key: key, value: $0) })
+        default:
+            return value
+        }
     }
 }

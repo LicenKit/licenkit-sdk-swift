@@ -1,149 +1,87 @@
-# Swift SDK 目标 API 合同
+# Swift SDK V1 API
 
-> 以下接口是 V1 目标设计，当前源码尚未全部对齐。
-
-## 1. 配置
+## 配置
 
 ```swift
 public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
     public let accountID: String
     public let productID: String
+    public let releaseVersion: String
+    public let releasePlatform: String
     public let trustedSigningKeys: [String: String]
     public let timeoutInterval: TimeInterval
     public let accessGroup: String?
-
-    public init(
-        serverURL: URL,
-        accountID: String,
-        productID: String,
-        trustedSigningKeys: [String: String] = [:],
-        timeoutInterval: TimeInterval = 15,
-        accessGroup: String? = nil
-    )
 }
 ```
 
-## 2. Facade
+Release 版本与工件平台属于构建身份，不接收客户端自报发布时间。`trustedSigningKeys` 是随 App 受信发布链交付的 key ID 到 Ed25519 公钥映射。
+
+## Facade
 
 ```swift
-public final class LicenKit: Sendable {
-    public static func configure(with configuration: LicenKitConfiguration)
-    public static var shared: LicenKit { get }
-
-    public func activate(licenseKey: String, machineName: String? = nil) async throws -> ActivationResult
-    public func checkLocalStatus() async throws -> LicenseStatus
-    public func validate() async throws -> LicenseStatus
-    public func deactivate() async throws -> DeactivationResult
-    public func hasFeature(_ feature: String) async throws -> Bool
-}
+public func activate(licenseKey: String, machineName: String? = nil) async throws -> ActivationResult
+public func validate() async throws -> LicenseStatus
+public func checkLocalStatus() async throws -> LicenseStatus
+public func startTrial() async throws -> LicenseStatus
+public func validateTrial() async throws -> LicenseStatus
+public func deactivate() async throws -> DeactivationResult
+public func clearLocalTrial() async throws
+public func hasFeature(_ feature: String) -> Bool
 ```
 
-## 3. 激活结果
+`activate` 不长期保存注册码。`validate` 不把网络失败转换成有效、过期或吊销状态。`deactivate` 仅在服务端确认解绑后清除本地凭据。
+
+## 状态
 
 ```swift
-public struct ActivationResult: Sendable, Equatable {
-    public let activationID: String
-    public let verificationMode: VerificationMode
-    public let status: LicenseStatus
-}
-
-public enum VerificationMode: String, Codable, Sendable {
-    case online
-    case signedOffline = "signed_offline"
-}
-```
-
-## 4. License 状态
-
-```swift
-public enum LicenseStatus: Sendable, Equatable {
+public enum LicenseStatus: Equatable, Sendable {
     case unactivated
     case validOnline(terms: LicenseTerms)
-    case validOffline(claims: LicenseClaims)
+    case trialValidOnline(expiresAt: Date, features: [String])
+    case validLocally(claims: LicenseClaims)
     case temporarilyUnverified(lastValidatedAt: Date, cachedTerms: LicenseTerms?)
     case onlineValidationRequired
     case suspended(reason: String?)
     case expired(expiresAt: Date?)
+    case productReleaseUnknown(version: String, platform: String)
+    case updateEntitlementRequired(updatesUntil: Date, releaseVersion: String, releasedAt: Date)
     case revoked(reason: String?)
     case activationRevoked
+    case trialExpired(expiresAt: Date)
+    case trialRevoked(reason: String?)
     case untrusted(reason: String)
 }
 ```
 
-`validOffline` 只在 Ed25519 验签成功后出现。
+只有 `validOnline`、`trialValidOnline` 和 `validLocally` 的 `isUsable` 为 `true`。宿主 App 可以自行处理 `.temporarilyUnverified`，但 SDK 不默认把它视为有效授权。
 
-## 5. 授权条款
+## Signed License Token
 
-```swift
-public struct LicenseTerms: Codable, Sendable, Equatable {
-    public let maxActivations: Int
-    public let features: [String]
-    public let licenseExpiresAt: Date?
-    public let offlineTokenExpiresAt: Date?
-}
-```
+Token 是紧凑 JWS：
 
-SDK 不暴露或修改 License Plan。这里只表示当前 License 已固化并由服务端返回的条款。
+- Header 固定要求 `alg=EdDSA`、`typ=licenkit-license+jwt` 与已知 `kid`；
+- Claims 要求 `lic`、`act`、`acc`、`prd`、`rel`、`ver`、`plt`、`rat`、`fp`、`iat`、`exp`、`lexp`、`upd`、`fea`；
+- `lexp` 可为空表示永久 License；`upd` 可为空表示不限制未来版本；
+- SDK 验证 `ver` 与 `plt` 等于当前构建，并要求 `rat <= upd`；
+- Claims 不包含注册码。
 
-## 6. Offline Token Claims
+## 错误
 
 ```swift
-public struct LicenseClaims: Codable, Sendable, Equatable {
-    public let licenseID: String
-    public let activationID: String
-    public let accountID: String
-    public let productID: String
-    public let fingerprint: String
-    public let issuedAt: Date
-    public let tokenExpiresAt: Date
-    public let licenseExpiresAt: Date?
-    public let features: [String]
-    public let signingKeyID: String
-}
-```
-
-Claims 不包含注册码。
-
-## 7. 解绑结果
-
-```swift
-public enum DeactivationResult: Sendable, Equatable {
-    case completed
-    case remoteFailed(localCredentialsPreserved: Bool, error: LicenKitError)
-}
-```
-
-如果 Swift 的递归 Equatable 或 Error 设计导致实现不合理，可以移除 Equatable，但不能移除远端失败与本地状态的区分。
-
-## 8. 错误
-
-```swift
-public enum LicenKitError: Error, Sendable {
-    case notConfigured
-    case invalidConfiguration(String)
+public enum LicenKitError: Error, Equatable, Sendable {
+    case apiError(code: String, message: String, requestID: String?, details: [String: String])
+    case transportError(kind: TransportErrorKind, underlyingDescription: String)
     case missingTrustedSigningKey(keyID: String)
-    case invalidOfflineToken(reason: String)
-    case apiError(
-        code: String,
-        message: String,
-        requestID: String?,
-        details: [String: String]
-    )
-    case transportError(kind: TransportErrorKind, description: String)
+    case invalidSignedLicenseToken(reason: String)
+    case releaseNotQualified(status: LicenseStatus)
     case credentialStorageError(operation: String, status: Int32)
-    case decodingError(description: String)
+    // 另含未激活、试用未开始、指纹与协议错误。
 }
 ```
 
-服务端新增错误码时，SDK 应通过 `apiError` 保留原值，不得因为本地枚举未更新而降级成没有来源的 unknown error。
+HTTP 5xx 属于 `.transportError(.server(...))`，其中仍保存安全可记录的服务端 code、request ID 和 details；4xx 业务拒绝通过 `.apiError` 原样到达宿主 App。`LICENSE_CHECKOUT_VERIFICATION_ONLY` 不会被归一化为过期或无效注册码。
 
-## 9. 兼容边界
+## Trial
 
-V1 是不承诺源码兼容的主版本重构。以下旧接口可以直接调整：
-
-- `publicKey: String` 必填改为 `trustedSigningKeys` 可空；
-- `verifyOffline()` 改为 `checkLocalStatus()`；
-- ActivationResult 和 LicenseStatus 重新表达两种模式；
-- 停止保存 roaming license key；
-- `deactivate()` 不再静默吞掉远端错误。
+Product/设备 Trial Claim 使用独立 `trialID + trialToken` Keychain 记录和 `/trials/claim`、`/trials/validate` 在线接口。Trial 没有 `.validLocally`。Paddle 免费订阅试用得到普通 License Key，应调用 `activate()`，不调用 Trial Claim API。

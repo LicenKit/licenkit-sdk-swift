@@ -1,508 +1,388 @@
 import Foundation
 
-/// LicenKit Swift 客户端门面，提供统一的授权管理、在线激活、心跳探活与脱网离线验签能力
 public final class LicenKit: @unchecked Sendable {
-    
-    // MARK: - Singleton
-    
     private static let lock = NSLock()
-    private static var _shared: LicenKit?
-    
-    /// 初始化全局共享实例
+    private static var instance: LicenKit?
+
     public static func configure(with configuration: LicenKitConfiguration) {
         lock.lock()
         defer { lock.unlock() }
-        _shared = LicenKit(configuration: configuration)
+        instance = LicenKit(configuration: configuration)
     }
-    
-    /// 获取全局共享实例
+
     public static var shared: LicenKit {
         lock.lock()
         defer { lock.unlock() }
-        guard let instance = _shared else {
-            fatalError("LicenKit has not been initialized. Please call LicenKit.configure(with:) before accessing LicenKit.shared.")
-        }
+        guard let instance else { fatalError("Call LicenKit.configure(with:) before using LicenKit.shared") }
         return instance
     }
-    
-    // MARK: - Properties
-    
+
     public let configuration: LicenKitConfiguration
     private let credentialStore: CredentialStore
     private let fingerprintProvider: DeviceFingerprintProvider
-    private let ed25519Verifier: Ed25519Verifier
-    private let claimsEvaluator: ClaimsEvaluator
+    private let verifier = Ed25519Verifier()
+    private let claimsEvaluator = ClaimsEvaluator()
     private let apiClient: LicenKitAPIClient
-    public let retryCoordinator: LicenKitRetryCoordinator
-    
     private let stateLock = NSLock()
-    private var _cachedStatus: LicenseStatus?
-    
-    /// 当前内存中缓存的许可证状态
+    private var storedCachedStatus: LicenseStatus?
+
     public var cachedStatus: LicenseStatus? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return _cachedStatus
+        return storedCachedStatus
     }
-    
-    // MARK: - Initialization
-    
+
     public init(
         configuration: LicenKitConfiguration,
         credentialStore: CredentialStore? = nil,
         fingerprintProvider: DeviceFingerprintProvider? = nil,
-        retryCoordinator: LicenKitRetryCoordinator? = nil,
         apiClient: LicenKitAPIClient? = nil
     ) {
         self.configuration = configuration
         self.credentialStore = credentialStore ?? KeychainStore(
-            productId: configuration.productId,
+            productID: configuration.productID,
             accessGroup: configuration.accessGroup
         )
-        
         #if os(macOS)
         self.fingerprintProvider = fingerprintProvider ?? MacOSFingerprintProvider()
         #else
         self.fingerprintProvider = fingerprintProvider ?? UnsupportedPlatformFingerprintProvider()
         #endif
-        
-        self.ed25519Verifier = Ed25519Verifier()
-        self.claimsEvaluator = ClaimsEvaluator()
         self.apiClient = apiClient ?? LicenKitAPIClient(
-            serverUrl: configuration.serverUrl,
+            serverURL: configuration.serverURL,
             timeoutInterval: configuration.timeoutInterval
         )
-        self.retryCoordinator = retryCoordinator ?? LicenKitRetryCoordinator.shared
     }
-    
-    // MARK: - Public APIs
-    
-    /// 纯脱网离线执行 Ed25519 密码学签名核验与硬件指纹校验 (0 网络耗时)
-    @discardableResult
-    public func verifyOffline() async throws -> LicenseStatus {
-        let fingerprint = try await fingerprintProvider.getFingerprint()
-        
-        guard let creds = try credentialStore.loadCredentials(for: fingerprint) else {
-            setCachedStatus(.expired(claims: nil))
-            throw LicenKitError.unactivated
-        }
-        
-        // 执行自适应 Ed25519 签名验证与反序列化 (支持正式版 License 与免密 Trial)
-        let (_, claims) = try ed25519Verifier.verifyAndDecodeAnyToken(
-            token: creds.token,
-            publicKeyInput: configuration.publicKey
-        )
-        
-        let status: LicenseStatus
-        switch claims {
-        case .license(let licenseClaims):
-            status = claimsEvaluator.evaluate(
-                claims: licenseClaims,
-                currentFingerprint: fingerprint,
-                lastValidatedAt: creds.lastValidatedAt,
-                offlineGracePeriodSeconds: Double(creds.offlineGracePeriod)
-            )
-        case .trial(let trialClaims):
-            status = claimsEvaluator.evaluateTrial(
-                claims: trialClaims,
-                currentFingerprint: fingerprint
-            )
-        }
-        
-        setCachedStatus(status)
-        return status
-    }
-    
-    /// 向服务端发起设备免费试用认领，并持久化试用凭据至 Keychain
-    @discardableResult
-    public func requestTrial() async throws -> TrialResult {
-        let fingerprint = try await fingerprintProvider.getFingerprint()
-        
-        let request = ApiTrialRequest(
-            accountId: configuration.accountId,
-            productId: configuration.productId,
-            fingerprint: fingerprint
-        )
-        
-        let response = try await retryCoordinator.execute(scenario: .foregroundActivation) {
-            try await self.apiClient.requestTrial(request: request)
-        }
-        
-        let claimedAt = response.claimedAt?.date
-        let expiresAt = response.expiresAt?.date
-        
-        // 若服务端判定已过期或未下发 Token
-        guard let token = response.token, !token.isEmpty, !response.expired else {
-            let expiredResult = TrialResult(
-                trialClaimed: response.trialClaimed,
-                alreadyClaimed: response.alreadyClaimed,
-                expired: true,
-                token: response.token,
-                claimedAt: claimedAt,
-                expiresAt: expiresAt,
-                features: response.features
-            )
-            setCachedStatus(.trialExpired(claims: nil))
-            return expiredResult
-        }
-        
-        // 首次脱网验签自检，确保证书本地立即可用
-        let (_, trialClaims): (OfflineTokenHeader, TrialClaims) = try ed25519Verifier.verifyAndDecodeToken(
-            token: token,
-            publicKeyInput: configuration.publicKey
-        )
-        
-        // 保存试用凭据至 Keychain (免密钥标记 isTrial = true)
-        let creds = StoredCredentials(
-            licenseKey: "",
-            token: token,
-            lastValidatedAt: Date(),
-            offlineGracePeriod: 0,
-            policyFeatures: response.features,
-            machineId: "",
-            isTrial: true
-        )
-        try credentialStore.saveCredentials(creds, for: fingerprint)
-        
-        let status = claimsEvaluator.evaluateTrial(
-            claims: trialClaims,
-            currentFingerprint: fingerprint
-        )
-        setCachedStatus(status)
-        
-        return TrialResult(
-            trialClaimed: response.trialClaimed,
-            alreadyClaimed: response.alreadyClaimed,
-            expired: response.expired,
-            token: token,
-            claimedAt: claimedAt ?? trialClaims.issuedAt,
-            expiresAt: expiresAt ?? trialClaims.expirationDate,
-            features: response.features
-        )
-    }
-    
-    /// 在线激活当前设备席位，并持久化新凭据至 Keychain
+
     @discardableResult
     public func activate(licenseKey: String, machineName: String? = nil) async throws -> ActivationResult {
         let fingerprint = try await fingerprintProvider.getFingerprint()
-        
-        let platformName: String
-        #if os(macOS)
-        platformName = "macOS"
-        #elseif os(iOS)
-        platformName = "iOS"
-        #else
-        platformName = "Apple"
-        #endif
-        
-        let hostName: String = {
-            if let customName = machineName, !customName.isEmpty {
-                return customName
-            }
-            #if os(macOS)
-            return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-            #else
-            return ProcessInfo.processInfo.hostName
-            #endif
-        }()
-        
-        let request = ApiActivateRequest(
-            accountId: configuration.accountId,
+        let response = try await apiClient.activate(request: APIActivateRequest(
+            accountID: configuration.accountID,
+            productID: configuration.productID,
             licenseKey: licenseKey,
             fingerprint: fingerprint,
-            platform: platformName,
-            name: hostName
-        )
-        
-        let response = try await retryCoordinator.execute(scenario: .foregroundActivation) {
-            try await self.apiClient.activate(request: request)
+            devicePlatform: Self.devicePlatform,
+            name: machineName ?? ProcessInfo.processInfo.hostName,
+            releaseVersion: configuration.releaseVersion,
+            releasePlatform: configuration.releasePlatform
+        ))
+        let localStatus = try verifyCredentialResponse(response, fingerprint: fingerprint)
+        guard localStatus.isUsable else {
+            if case .updateEntitlementRequired = localStatus {
+                throw LicenKitError.releaseNotQualified(status: localStatus)
+            }
+            throw LicenKitError.invalidSignedLicenseToken(reason: "signed credential is not locally valid: \(localStatus)")
         }
-        
-        guard let token = response.token, !token.isEmpty else {
-            throw LicenKitError.invalidToken("Server did not return an offline verification token")
-        }
-        
-        // 首次脱网验签自检，确保证书在本地立即可用
-        let (_, claims): (OfflineTokenHeader, LicenseClaims) = try ed25519Verifier.verifyAndDecodeToken(
-            token: token,
-            publicKeyInput: configuration.publicKey
-        )
-        
-        // 持久化到 Keychain (按当前机器指纹隔离保存，防止多设备 iCloud 同步冲突)
-        // 遵循双凭据架构：本地磁盘不保留激活码明文，仅持久化 machineToken 与 machineId
-        let creds = StoredCredentials(
-            licenseKey: "",
-            machineToken: response.machineToken ?? "",
-            token: token,
-            lastValidatedAt: Date(),
-            offlineGracePeriod: response.policy.offlineGracePeriod,
-            policyFeatures: response.policy.features,
-            machineId: response.machineId
-        )
-        try credentialStore.saveCredentials(creds, for: fingerprint)
-        
-        // 同步漫游激活码至 iCloud Keychain，供同一 Apple ID 下的新设备无感恢复
-        try? credentialStore.saveRoamingLicenseKey(licenseKey)
-        
-        let status = claimsEvaluator.evaluate(
-            claims: claims,
-            currentFingerprint: fingerprint,
-            lastValidatedAt: creds.lastValidatedAt,
-            offlineGracePeriodSeconds: Double(creds.offlineGracePeriod)
-        )
+        let credentials = storedCredentials(from: response)
+        try credentialStore.saveCredentials(credentials, for: fingerprint)
+        try credentialStore.clearTrialCredentials(for: fingerprint)
+        let status = LicenseStatus.validOnline(terms: response.terms)
         setCachedStatus(status)
-        
-        let tokenExpiresAt = response.tokenExpiresAt?.date ?? claims.expirationDate
-        let licenseExpiresAt = response.licenseExpiresAt?.date
-        
         return ActivationResult(
-            activated: response.activated,
-            reused: response.reused,
-            machineId: response.machineId,
-            token: token,
-            tokenExpiresAt: tokenExpiresAt,
-            licenseExpiresAt: licenseExpiresAt,
-            policy: response.policy
+            activationID: response.activationID,
+            credentialMode: response.credentialMode,
+            status: status
         )
     }
-    
-    /// 在线发送心跳探活，刷新许可证状态并在必要时续签本地 Token
-    /// 遵循 Fail-Silent 原则：
-    /// - 若当前本地主状态可用，遇网络超时、服务端 5xx、429 或 Session 熔断，一律静默保底，维持本地主状态可用，零弹窗零干扰；
-    /// - 若当前本地主状态已不可用（已过期/试用结束），保持原判并抛出异常，绝不伪造放行。
+
     @discardableResult
-    public func validate() async throws -> ValidationResult {
-        return try await executeValidation(scenario: .backgroundSync)
-    }
-    
-    /// 前台主动刷新授权（供用户在界面点击【刷新授权】或【检查续费】时调用）
-    /// 遵循前台交互语义：
-    /// - 重置当前 Session 熔断，采用前台重试策略 (foregroundActivation)；
-    /// - 成功获取新 Token 后更新本地凭据并恢复主状态；
-    /// - 若网络不可用或服务端故障，直接抛出异常供 UI 弹窗或 Toast 提示，主状态继续维持不变。
-    @discardableResult
-    public func refresh() async throws -> ValidationResult {
-        retryCoordinator.resetSessionBlock()
-        return try await executeValidation(scenario: .foregroundActivation)
-    }
-    
-    private func executeValidation(scenario: RequestScenario) async throws -> ValidationResult {
+    public func validate() async throws -> LicenseStatus {
         let fingerprint = try await fingerprintProvider.getFingerprint()
-        
-        guard let creds = try credentialStore.loadCredentials(for: fingerprint) else {
+        guard let current = try credentialStore.loadCredentials(for: fingerprint) else {
+            setCachedStatus(.unactivated)
             throw LicenKitError.unactivated
         }
-        
-        // 读取当前本地离线客观主状态
-        let currentStatus = (try? await verifyOffline()) ?? .expired(claims: nil)
-        if case .untrusted(let reason) = currentStatus {
-            throw LicenKitError.cryptoError(reason)
-        }
-        
         do {
-            if creds.isTrial {
-                // 统一通过调度器执行 Trial 探活
-                let trialResponse = try await retryCoordinator.execute(scenario: scenario) {
-                    let request = ApiTrialRequest(
-                        accountId: self.configuration.accountId,
-                        productId: self.configuration.productId,
-                        fingerprint: fingerprint
-                    )
-                    return try await self.apiClient.requestTrial(request: request)
-                }
-                
-                let isValid = !trialResponse.expired && trialResponse.token != nil
-                if !isValid {
-                    if trialResponse.expired {
-                        setCachedStatus(.trialExpired(claims: currentStatus.trialClaims))
-                    } else {
-                        _ = try? await verifyOffline()
-                    }
-                    return ValidationResult(
-                        valid: false,
-                        token: trialResponse.token,
-                        tokenExpiresAt: trialResponse.expiresAt?.date,
-                        licenseExpiresAt: trialResponse.expiresAt?.date,
-                        reason: "Trial expired"
-                    )
-                }
-                
-                let updatedToken = trialResponse.token ?? creds.token
-                let updatedCreds = StoredCredentials(
-                    licenseKey: creds.licenseKey,
-                    machineToken: creds.machineToken,
-                    token: updatedToken,
-                    lastValidatedAt: Date(),
-                    offlineGracePeriod: creds.offlineGracePeriod,
-                    policyFeatures: creds.policyFeatures,
-                    machineId: creds.machineId,
-                    isTrial: true
-                )
-                try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
-                _ = try? await verifyOffline()
-                
-                return ValidationResult(
-                    valid: true,
-                    token: updatedToken,
-                    tokenExpiresAt: trialResponse.expiresAt?.date,
-                    licenseExpiresAt: trialResponse.expiresAt?.date
-                )
-            } else {
-                let request = ApiValidateRequest(
-                    accountId: configuration.accountId,
-                    machineId: creds.machineId,
-                    machineToken: creds.machineToken,
-                    fingerprint: fingerprint
-                )
-                
-                let response = try await retryCoordinator.execute(scenario: scenario) {
-                    try await self.apiClient.validate(request: request)
-                }
-                
-                let tokenExpiresAt = response.tokenExpiresAt?.date
-                let licenseExpiresAt = response.licenseExpiresAt?.date
-                
-                // 若服务端明确业务拒绝 (valid == false) -> 严厉封锁置为 untrusted
-                if !response.valid {
-                    setCachedStatus(.untrusted(reason: response.reason ?? "License invalid or revoked by server"))
-                    return ValidationResult(
-                        valid: false,
-                        token: response.token,
-                        tokenExpiresAt: tokenExpiresAt,
-                        licenseExpiresAt: licenseExpiresAt,
-                        reason: response.reason
-                    )
-                }
-                
-                var updatedToken = creds.token
-                if let newToken = response.token, !newToken.isEmpty {
-                    updatedToken = newToken
-                }
-                
-                let updatedCreds = StoredCredentials(
-                    licenseKey: creds.licenseKey,
-                    machineToken: creds.machineToken,
-                    token: updatedToken,
-                    lastValidatedAt: Date(),
-                    offlineGracePeriod: creds.offlineGracePeriod,
-                    policyFeatures: creds.policyFeatures,
-                    machineId: creds.machineId,
-                    isTrial: false
-                )
-                try credentialStore.saveCredentials(updatedCreds, for: fingerprint)
-                _ = try? await verifyOffline()
-                
-                return ValidationResult(
-                    valid: true,
-                    token: updatedToken,
-                    tokenExpiresAt: tokenExpiresAt,
-                    licenseExpiresAt: licenseExpiresAt,
-                    reason: response.reason
-                )
+            let response = try await apiClient.validate(request: APIValidateRequest(
+                accountID: configuration.accountID,
+                productID: configuration.productID,
+                activationID: current.activationID,
+                machineToken: current.machineToken,
+                fingerprint: fingerprint,
+                devicePlatform: Self.devicePlatform,
+                releaseVersion: configuration.releaseVersion,
+                releasePlatform: configuration.releasePlatform
+            ))
+            guard response.activationID == current.activationID else {
+                throw LicenKitError.protocolError(reason: "validation response changed activation_id")
             }
+            let localStatus = try verifyCredentialResponse(response, fingerprint: fingerprint)
+            guard localStatus.isUsable else {
+                if case .updateEntitlementRequired = localStatus {
+                    throw LicenKitError.releaseNotQualified(status: localStatus)
+                }
+                throw LicenKitError.invalidSignedLicenseToken(reason: "refreshed credential is not locally valid: \(localStatus)")
+            }
+            try credentialStore.saveCredentials(storedCredentials(from: response), for: fingerprint)
+            let status = LicenseStatus.validOnline(terms: response.terms)
+            setCachedStatus(status)
+            return status
         } catch let error as LicenKitError {
-            // 1. 业务级显式失效 (如 LICENSE_NOT_FOUND, MACHINE_REVOKED) -> 坚决封锁，不走降级
-            if error.isExplicitBusinessRejection {
-                setCachedStatus(.untrusted(reason: "License no longer valid on server"))
-                throw error
-            }
-            
-            // 2. 基础设施/网络/5xx/限流/Session 熔断
-            if scenario == .backgroundSync {
-                // 后台探活：Fail-Silent 保底
-                if currentStatus.isValid {
-                    return ValidationResult(
-                        valid: true,
-                        token: creds.token,
-                        tokenExpiresAt: currentStatus.expirationDate,
-                        licenseExpiresAt: currentStatus.expirationDate,
-                        reason: "Fail-silent: server unavailable, retaining valid offline status"
-                    )
-                } else {
-                    // 本地已明确过期：维持不可用，绝不伪造放行
-                    throw error
-                }
-            } else {
-                // 前台主动刷新：抛出网络异常供 UI 明确处理
-                throw error
-            }
-        } catch {
-            if scenario == .backgroundSync && currentStatus.isValid {
-                return ValidationResult(
-                    valid: true,
-                    token: creds.token,
-                    tokenExpiresAt: currentStatus.expirationDate,
-                    licenseExpiresAt: currentStatus.expirationDate,
-                    reason: "Fail-silent: server unavailable, retaining valid offline status"
-                )
-            }
+            updateCachedStatus(for: error, currentCredentials: current)
             throw error
         }
     }
-    
-    /// 释放当前机器席位并清空本地 Keychain 凭据
-    /// - Parameter clearRoamingKey: 是否连同 iCloud 漫游激活码一同清空（默认 false，仅解绑本机席位）
-    public func deactivate(clearRoamingKey: Bool = false) async throws {
-        let fingerprint = try? await fingerprintProvider.getFingerprint()
-        let savedCreds: StoredCredentials? = try? {
-            if let fp = fingerprint {
-                return try credentialStore.loadCredentials(for: fp)
-            }
-            return nil
-        }()
-        
-        // 无论网络端结果如何，本地必须保证清空当前指纹的 Keychain 凭据
-        defer {
-            if let fp = fingerprint {
-                try? credentialStore.clearCredentials(for: fp)
-            }
-            if clearRoamingKey {
-                try? credentialStore.clearRoamingLicenseKey()
-            }
-            setCachedStatus(.untrusted(reason: "Deactivated"))
-        }
-        
-        if let creds = savedCreds, let fp = fingerprint, !creds.isTrial, (!creds.machineToken.isEmpty || !creds.machineId.isEmpty) {
-            let request = ApiDeactivateRequest(
-                accountId: configuration.accountId,
-                machineId: creds.machineId,
-                machineToken: creds.machineToken,
-                fingerprint: fp
-            )
-            _ = try? await apiClient.deactivate(request: request)
-        }
-    }
-    
-    /// 获取通过 iCloud Keychain 漫游同步的激活码 (若有)
-    public func getRoamingLicenseKey() throws -> String? {
-        try credentialStore.loadRoamingLicenseKey()
-    }
-    
-    /// 若检测到 iCloud 漫游激活码，自动发起新设备静默激活（无需用户重复输入激活码）
+
     @discardableResult
-    public func restoreAndActivateFromRoamingKey(machineName: String? = nil) async throws -> ActivationResult {
-        guard let roamingKey = try credentialStore.loadRoamingLicenseKey(), !roamingKey.isEmpty else {
-            throw LicenKitError.unactivated
+    public func checkLocalStatus() async throws -> LicenseStatus {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        if let credentials = try credentialStore.loadCredentials(for: fingerprint) {
+            switch credentials.credentialMode {
+            case .opaque:
+                let status = LicenseStatus.temporarilyUnverified(
+                    lastValidatedAt: credentials.lastValidatedAt,
+                    cachedTerms: credentials.cachedTerms
+                )
+                setCachedStatus(status)
+                return status
+            case .signed:
+                guard let token = credentials.signedLicenseToken else {
+                    let status = LicenseStatus.untrusted(reason: "stored signed credential has no Signed License Token")
+                    setCachedStatus(status)
+                    return status
+                }
+                let (_, claims) = try verifier.verifyAndDecodeToken(
+                    token: token,
+                    trustedSigningKeys: configuration.trustedSigningKeys
+                )
+                let status = claimsEvaluator.evaluate(
+                    claims: claims,
+                    configuration: configuration,
+                    activationID: credentials.activationID,
+                    currentFingerprint: fingerprint
+                )
+                setCachedStatus(status)
+                return status
+            }
         }
-        return try await activate(licenseKey: roamingKey, machineName: machineName)
+        if try credentialStore.loadTrialCredentials(for: fingerprint) != nil {
+            setCachedStatus(.onlineValidationRequired)
+            return .onlineValidationRequired
+        }
+        setCachedStatus(.unactivated)
+        return .unactivated
     }
-    
-    /// 内存级快速查询当前是否具备指定高级特性权限
-    public func hasFeature(_ featureKey: String) -> Bool {
-        guard let status = cachedStatus else { return false }
-        return status.hasFeature(featureKey)
+
+    @discardableResult
+    public func startTrial() async throws -> LicenseStatus {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        let response = try await apiClient.claimTrial(request: APITrialClaimRequest(
+            accountID: configuration.accountID,
+            productID: configuration.productID,
+            fingerprint: fingerprint,
+            devicePlatform: Self.devicePlatform,
+            releaseVersion: configuration.releaseVersion,
+            releasePlatform: configuration.releasePlatform
+        ))
+        guard response.status == "active",
+              let token = response.trialToken, !token.isEmpty,
+              let expiresAt = response.expiresAt.date else {
+            throw LicenKitError.protocolError(reason: "trial claim response did not contain a one-time active trial token")
+        }
+        try credentialStore.saveTrialCredentials(
+            StoredTrialCredentials(
+                trialID: response.trialID,
+                trialToken: token,
+                expiresAt: expiresAt,
+                features: response.features,
+                lastValidatedAt: Date()
+            ),
+            for: fingerprint
+        )
+        let status = LicenseStatus.trialValidOnline(expiresAt: expiresAt, features: response.features)
+        setCachedStatus(status)
+        return status
     }
-    
-    /// 获取当前设备的硬件指纹
-    public func getMachineFingerprint() async throws -> String {
-        return try await fingerprintProvider.getFingerprint()
+
+    @discardableResult
+    public func validateTrial() async throws -> LicenseStatus {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        guard let current = try credentialStore.loadTrialCredentials(for: fingerprint) else {
+            throw LicenKitError.trialNotStarted
+        }
+        do {
+            let response = try await apiClient.validateTrial(request: APITrialValidateRequest(
+                accountID: configuration.accountID,
+                productID: configuration.productID,
+                trialID: current.trialID,
+                trialToken: current.trialToken,
+                fingerprint: fingerprint,
+                releaseVersion: configuration.releaseVersion,
+                releasePlatform: configuration.releasePlatform
+            ))
+            guard response.trialID == current.trialID,
+                  response.status == "active",
+                  let expiresAt = response.expiresAt.date else {
+                throw LicenKitError.protocolError(reason: "trial validation response is inconsistent with stored credentials")
+            }
+            try credentialStore.saveTrialCredentials(
+                StoredTrialCredentials(
+                    trialID: current.trialID,
+                    trialToken: current.trialToken,
+                    expiresAt: expiresAt,
+                    features: response.features,
+                    lastValidatedAt: Date()
+                ),
+                for: fingerprint
+            )
+            let status = LicenseStatus.trialValidOnline(expiresAt: expiresAt, features: response.features)
+            setCachedStatus(status)
+            return status
+        } catch let error as LicenKitError {
+            updateCachedTrialStatus(for: error, credentials: current)
+            throw error
+        }
     }
-    
-    // MARK: - Private
-    
+
+    public func deactivate() async throws -> DeactivationResult {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        guard let credentials = try credentialStore.loadCredentials(for: fingerprint) else {
+            setCachedStatus(.unactivated)
+            return .completed
+        }
+        do {
+            let response = try await apiClient.deactivate(request: APIDeactivateRequest(
+                accountID: configuration.accountID,
+                productID: configuration.productID,
+                activationID: credentials.activationID,
+                machineToken: credentials.machineToken,
+                fingerprint: fingerprint
+            ))
+            guard response.status == "deactivated", response.activationID == credentials.activationID else {
+                return .remoteFailed(
+                    localCredentialsPreserved: true,
+                    underlying: .protocolError(reason: "server did not confirm remote deactivation")
+                )
+            }
+        } catch let error as LicenKitError {
+            return .remoteFailed(localCredentialsPreserved: true, underlying: error)
+        } catch {
+            return .remoteFailed(
+                localCredentialsPreserved: true,
+                underlying: .protocolError(reason: error.localizedDescription)
+            )
+        }
+        try credentialStore.clearCredentials(for: fingerprint)
+        setCachedStatus(.unactivated)
+        return .completed
+    }
+
+    public func clearLocalTrial() async throws {
+        let fingerprint = try await fingerprintProvider.getFingerprint()
+        try credentialStore.clearTrialCredentials(for: fingerprint)
+        setCachedStatus(.unactivated)
+    }
+
+    public func hasFeature(_ feature: String) -> Bool { cachedStatus?.hasFeature(feature) ?? false }
+    public func getMachineFingerprint() async throws -> String { try await fingerprintProvider.getFingerprint() }
+
+    private func verifyCredentialResponse(_ response: APICredentialResponse, fingerprint: String) throws -> LicenseStatus {
+        guard !response.activationID.isEmpty, !response.machineToken.isEmpty else {
+            throw LicenKitError.protocolError(reason: "credential response is missing activation_id or machine_token")
+        }
+        switch response.credentialMode {
+        case .opaque:
+            guard response.signedLicenseToken == nil else {
+                throw LicenKitError.protocolError(reason: "opaque response unexpectedly contained a Signed License Token")
+            }
+            return .validOnline(terms: response.terms)
+        case .signed:
+            guard let token = response.signedLicenseToken, let responseKeyID = response.signingKeyID else {
+                throw LicenKitError.protocolError(reason: "signed response is missing signed_license_token or signing_key_id")
+            }
+            let (header, claims) = try verifier.verifyAndDecodeToken(
+                token: token,
+                trustedSigningKeys: configuration.trustedSigningKeys
+            )
+            guard header.kid == responseKeyID else {
+                throw LicenKitError.invalidSignedLicenseToken(reason: "response signing_key_id does not match protected kid")
+            }
+            return claimsEvaluator.evaluate(
+                claims: claims,
+                configuration: configuration,
+                activationID: response.activationID,
+                currentFingerprint: fingerprint
+            )
+        }
+    }
+
+    private func storedCredentials(from response: APICredentialResponse) -> StoredCredentials {
+        StoredCredentials(
+            activationID: response.activationID,
+            machineToken: response.machineToken,
+            credentialMode: response.credentialMode,
+            signedLicenseToken: response.signedLicenseToken,
+            signingKeyID: response.signingKeyID,
+            lastValidatedAt: Date(),
+            cachedTerms: response.terms
+        )
+    }
+
+    private func updateCachedStatus(for error: LicenKitError, currentCredentials: StoredCredentials) {
+        guard case .apiError(let code, _, _, let details) = error else { return }
+        let status: LicenseStatus?
+        switch code {
+        case "PRODUCT_RELEASE_UNKNOWN":
+            status = .productReleaseUnknown(version: configuration.releaseVersion, platform: configuration.releasePlatform)
+        case "LICENSE_SUSPENDED": status = .suspended(reason: details["status_reason"] ?? details["reason"])
+        case "LICENSE_REVOKED": status = .revoked(reason: details["status_reason"] ?? details["reason"])
+        case "ACTIVATION_REVOKED": status = .activationRevoked
+        case "LICENSE_EXPIRED": status = .expired(expiresAt: parseDate(details["expires_at"]))
+        case "UPDATE_ENTITLEMENT_REQUIRED":
+            if let updatesUntil = parseDate(details["updates_until"]),
+               let releasedAt = parseDate(details["released_at"]) {
+                status = .updateEntitlementRequired(
+                    updatesUntil: updatesUntil,
+                    releaseVersion: details["release_version"] ?? configuration.releaseVersion,
+                    releasedAt: releasedAt
+                )
+            } else { status = nil }
+        default: status = nil
+        }
+        if let status { setCachedStatus(status) }
+        else if code.hasPrefix("LICENSE_") { setCachedStatus(.untrusted(reason: code)) }
+        else { _ = currentCredentials }
+    }
+
+    private func updateCachedTrialStatus(for error: LicenKitError, credentials: StoredTrialCredentials) {
+        guard case .apiError(let code, _, _, let details) = error else { return }
+        switch code {
+        case "TRIAL_EXPIRED": setCachedStatus(.trialExpired(expiresAt: parseDate(details["expires_at"]) ?? credentials.expiresAt))
+        case "TRIAL_REVOKED": setCachedStatus(.trialRevoked(reason: details["revoke_reason"] ?? details["reason"]))
+        case "PRODUCT_RELEASE_UNKNOWN":
+            setCachedStatus(.productReleaseUnknown(version: configuration.releaseVersion, platform: configuration.releasePlatform))
+        default: break
+        }
+    }
+
+    private func parseDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        if let seconds = TimeInterval(value) { return Date(timeIntervalSince1970: seconds) }
+        return FlexibleDate.parseISO8601(value)
+    }
+
     private func setCachedStatus(_ status: LicenseStatus) {
         stateLock.lock()
-        defer { stateLock.unlock() }
-        self._cachedStatus = status
+        storedCachedStatus = status
+        stateLock.unlock()
+    }
+
+    private static var devicePlatform: String {
+        #if os(macOS)
+        let osName = "macos"
+        #elseif os(iOS)
+        let osName = "ios"
+        #else
+        let osName = "apple"
+        #endif
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        let architecture = "unknown"
+        #endif
+        return "\(osName)-\(architecture)"
     }
 }
