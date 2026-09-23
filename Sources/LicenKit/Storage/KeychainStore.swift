@@ -34,6 +34,14 @@ public struct KeychainStore: CredentialStore, Sendable {
         try delete(account: accountKey(prefix: "trial", fingerprint: fingerprint))
     }
 
+    public func loadSnapshot(for fingerprint: String) throws -> StoredEntitlementSnapshot? {
+        try read(StoredEntitlementSnapshot.self, account: accountKey(prefix: "snapshot", fingerprint: fingerprint))
+    }
+
+    public func saveSnapshot(_ snapshot: StoredEntitlementSnapshot, for fingerprint: String) throws {
+        try write(snapshot, account: accountKey(prefix: "snapshot", fingerprint: fingerprint))
+    }
+
     private func accountKey(prefix: String, fingerprint: String) -> String {
         "\(prefix)_\(fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
     }

@@ -1,47 +1,55 @@
 import Foundation
 
-public struct ClaimsEvaluator: Sendable {
-    public init() {}
+enum SignedLicenseEvaluation: Equatable, Sendable {
+    case active(claims: LicenseClaims)
+    case licenseExpired(expiresAt: Date)
+    case releaseNotEligible(ReleaseEligibilityIssue)
+}
 
-    public func evaluate(
+struct ClaimsEvaluator: Sendable {
+
+    func evaluate(
         claims: LicenseClaims,
         configuration: LicenKitConfiguration,
         activationID: String,
         currentFingerprint: String,
         now: Date = Date()
-    ) -> LicenseStatus {
-        guard claims.accountID == configuration.accountID else {
-            return .untrusted(reason: "Signed License Token account does not match SDK configuration")
+    ) throws -> SignedLicenseEvaluation {
+        guard claims.instanceID == configuration.instanceID else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token instance does not match SDK configuration")
         }
         guard claims.productID == configuration.productID else {
-            return .untrusted(reason: "Signed License Token product does not match SDK configuration")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token product does not match SDK configuration")
         }
         guard claims.activationID == activationID else {
-            return .untrusted(reason: "Signed License Token activation does not match stored credentials")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token activation does not match stored credentials")
         }
         guard claims.fingerprint.caseInsensitiveCompare(currentFingerprint) == .orderedSame else {
-            return .untrusted(reason: "Signed License Token fingerprint does not match this device")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token fingerprint does not match this device")
         }
         guard claims.releaseVersion == configuration.releaseVersion,
               claims.releasePlatform == configuration.releasePlatform else {
-            return .untrusted(reason: "Signed License Token release identity does not match this build")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token release identity does not match this build")
         }
         guard claims.issuedAt <= now.addingTimeInterval(300) else {
-            return .untrusted(reason: "Signed License Token was issued in the future")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token was issued in the future")
         }
         guard claims.tokenExpiresAt > now else {
-            return .expired(expiresAt: claims.tokenExpiresAt)
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token has expired")
         }
         if let licenseExpiration = claims.licenseExpiresAt, licenseExpiration <= now {
-            return .expired(expiresAt: licenseExpiration)
+            return .licenseExpired(expiresAt: licenseExpiration)
         }
         if let updatesUntil = claims.updatesUntil, claims.releasedAt > updatesUntil {
-            return .updateEntitlementRequired(
-                updatesUntil: updatesUntil,
-                releaseVersion: claims.releaseVersion,
-                releasedAt: claims.releasedAt
+            return .releaseNotEligible(
+                .updateRequired(
+                    code: "UPDATE_ENTITLEMENT_REQUIRED",
+                    updatesUntil: updatesUntil,
+                    releaseVersion: claims.releaseVersion,
+                    releasedAt: claims.releasedAt
+                )
             )
         }
-        return .validLocally(claims: claims)
+        return .active(claims: claims)
     }
 }

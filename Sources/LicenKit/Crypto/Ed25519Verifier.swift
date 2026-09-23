@@ -63,8 +63,11 @@ public struct Ed25519Verifier: Sendable {
         guard let payloadDictionary = payloadObject as? [String: Any] else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "claims payload must be an object")
         }
+        guard payloadDictionary["acc"] == nil else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "legacy tenant claim is not accepted")
+        }
         let requiredClaims: Set<String> = [
-            "lic", "act", "acc", "prd", "rel", "ver", "plt", "rat", "fp", "iat", "exp", "lexp", "upd", "fea"
+            "lic", "act", "ins", "prd", "rel", "ver", "plt", "rat", "fp", "iat", "exp", "lexp", "upd", "fea"
         ]
         guard requiredClaims.isSubset(of: Set(payloadDictionary.keys)) else {
             let missing = requiredClaims.subtracting(Set(payloadDictionary.keys)).sorted().joined(separator: ",")

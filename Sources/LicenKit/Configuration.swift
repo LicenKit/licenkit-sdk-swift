@@ -2,7 +2,7 @@ import Foundation
 
 public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
-    public let accountID: String
+    public let instanceID: String
     public let productID: String
     public let releaseVersion: String
     public let releasePlatform: String
@@ -12,7 +12,7 @@ public struct LicenKitConfiguration: Sendable {
 
     public init(
         serverURL: URL,
-        accountID: String,
+        instanceID: String,
         productID: String,
         releaseVersion: String,
         releasePlatform: String,
@@ -21,7 +21,7 @@ public struct LicenKitConfiguration: Sendable {
         accessGroup: String? = nil
     ) {
         self.serverURL = serverURL
-        self.accountID = accountID
+        self.instanceID = instanceID
         self.productID = productID
         self.releaseVersion = releaseVersion
         self.releasePlatform = releasePlatform

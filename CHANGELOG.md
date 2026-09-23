@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Added `LicenKitResult<Value>` so Facade operations distinguish success, validation cooldown, and failure with the last known value.
+- Added `EntitlementSnapshot` and the unified License, Trial, activation-required, and Release-eligibility state model.
+- Added server/cache/signed-local/local state provenance, validation freshness, original business codes, safe details, and operation request IDs.
+
+### Changed
+- **Breaking Unified Validation Contract**:
+  - `activate`, `startTrial`, `validate`, and `deactivate` now return `LicenKitResult` instead of throwing business and transport failures.
+  - `validate()` now selects License, Trial, or no credential and uses the single `/api/v1/client/validate` protocol.
+  - Concurrent validations share one task; all credential and snapshot mutations are serialized with activation, Trial claiming, and deactivation.
+  - `validate()` now applies both the server interval and a hard-coded 30-second gate; an invalid or expired Signed License Token bypasses only the server interval.
+  - Only an explicit `/validate` server result advances request cooldown. Valid business data or an HTTP failure advances it; no-response transport failures and malformed 2xx data do not. HTTP failures do not advance `validatedAt`.
+  - Activation, Trial claiming, and deactivation do not participate in or initialize validation cooldown, and the SDK does not schedule background requests.
+  - Cached usability remains bounded by the effective validation interval, business expiry, and Signed License Token expiry.
+  - Deactivation preserves credentials on remote failure and returns an explicit local result when no License credential exists.
+- Signed responses now require the outer token expiry to match the signed absolute `exp`, and active state fields to match signed Claims. The configured TTL is not embedded in the token and may be shorter than the validation interval; `exp` is capped by the effective License expiry, which already includes snapshotted payment grace for billing Licenses.
+- **Breaking Instance Contract Rename**:
+  - Renamed the Swift configuration and request property from `accountID` to `instanceID`.
+  - Renamed the public JSON field from `account_id` to `instance_id`.
+  - Renamed the Signed License Token claim from `acc` to `ins`.
+  - Removed compatibility aliases; callers and tokens using the previous names are rejected.
+
+### Removed
+- Removed the separate `validateTrial()` and `checkLocalStatus()` Facade paths; `validate()` and `EntitlementSnapshot` now carry those responsibilities.
+- Removed the legacy `LicenseStatus`, `ActivationResult`, and `DeactivationResult` public state model.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
@@ -12,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implemented secure two-tier authentication architecture aligned with LicenKit server.
   - Local disk and Keychain scrub plaintext `licenseKey` upon activation and persist only `machineToken` and `machineId`.
   - Added `sub` claim to `LicenseClaims` with backwards-compatible `licenseKey` alias.
-  - Refactored `ApiValidateRequest` and `ApiDeactivateRequest` to use `(account_id, machine_id, machine_token, fingerprint)`.
+  - Refactored `ApiValidateRequest` and `ApiDeactivateRequest` around the then-current tenant ID, machine ID, machine token, and fingerprint contract. The current contract is documented in `[Unreleased]` above.
 - **High Availability Disaster Recovery & Resilience**:
   - Implemented `LicenKitRetryCoordinator` featuring dual-track execution:
     - **Track A (Foreground Blocking)**: `activate()` and `refresh()` with jittered exponential backoff (up to 3 retries) and immediate user feedback.

@@ -22,7 +22,7 @@ public struct LicenKitAPIClient: Sendable {
         try await send(path: "api/v1/client/activate", body: request)
     }
 
-    public func validate(request: APIValidateRequest) async throws -> APICredentialResponse {
+    public func validate(request: APIValidateRequest) async throws -> APIValidateResponse {
         try await send(path: "api/v1/client/validate", body: request)
     }
 
@@ -30,12 +30,8 @@ public struct LicenKitAPIClient: Sendable {
         try await send(path: "api/v1/client/deactivate", body: request)
     }
 
-    public func claimTrial(request: APITrialClaimRequest) async throws -> APITrialResponse {
+    public func claimTrial(request: APITrialClaimRequest) async throws -> APITrialClaimResponse {
         try await send(path: "api/v1/client/trials/claim", body: request)
-    }
-
-    public func validateTrial(request: APITrialValidateRequest) async throws -> APITrialResponse {
-        try await send(path: "api/v1/client/trials/validate", body: request)
     }
 
     private func send<Request: Encodable, Response: Decodable & Sendable>(
@@ -63,18 +59,22 @@ public struct LicenKitAPIClient: Sendable {
             throw LicenKitError.transportError(kind: .network, underlyingDescription: error.localizedDescription)
         }
         guard let http = response as? HTTPURLResponse else {
-            throw LicenKitError.transportError(kind: .invalidResponse(statusCode: nil), underlyingDescription: "response was not HTTP")
+            throw LicenKitError.transportError(
+                kind: .invalidResponse(statusCode: nil, requestID: nil),
+                underlyingDescription: "response was not HTTP"
+            )
         }
+        let headerRequestID = http.value(forHTTPHeaderField: "X-Request-ID")
         let envelope: LicenKitAPIResponse<Response>
         do { envelope = try JSONDecoder().decode(LicenKitAPIResponse<Response>.self, from: data) }
         catch {
             let kind = http.statusCode >= 500
                 ? TransportErrorKind.server(statusCode: http.statusCode, code: nil, requestID: http.value(forHTTPHeaderField: "X-Request-ID"), details: [:])
-                : .invalidResponse(statusCode: http.statusCode)
+                : .invalidResponse(statusCode: http.statusCode, requestID: headerRequestID)
             throw LicenKitError.transportError(kind: kind, underlyingDescription: "response JSON did not match the V1 envelope: \(error.localizedDescription)")
         }
 
-        let requestID = envelope.error?.requestID ?? http.value(forHTTPHeaderField: "X-Request-ID")
+        let requestID = envelope.error?.requestID ?? headerRequestID
         let details = sanitize(details: envelope.error?.details ?? [:])
         if http.statusCode >= 500 {
             throw LicenKitError.transportError(
@@ -84,6 +84,7 @@ public struct LicenKitAPIClient: Sendable {
         }
         if !(200...299).contains(http.statusCode) || envelope.success == false {
             throw LicenKitError.apiError(
+                statusCode: http.statusCode,
                 code: envelope.error?.code ?? "HTTP_\(http.statusCode)",
                 message: envelope.error?.message ?? "server rejected the request",
                 requestID: requestID,
@@ -92,7 +93,7 @@ public struct LicenKitAPIClient: Sendable {
         }
         guard envelope.success, let result = envelope.data else {
             throw LicenKitError.transportError(
-                kind: .invalidResponse(statusCode: http.statusCode),
+                kind: .invalidResponse(statusCode: http.statusCode, requestID: requestID),
                 underlyingDescription: "success response did not contain data"
             )
         }

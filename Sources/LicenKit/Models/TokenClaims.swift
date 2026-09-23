@@ -15,7 +15,7 @@ public struct SignedLicenseTokenHeader: Codable, Equatable, Sendable {
 public struct LicenseClaims: Codable, Equatable, Sendable {
     public let licenseID: String
     public let activationID: String
-    public let accountID: String
+    public let instanceID: String
     public let productID: String
     public let releaseID: String
     public let releaseVersion: String
@@ -31,7 +31,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case licenseID = "lic"
         case activationID = "act"
-        case accountID = "acc"
+        case instanceID = "ins"
         case productID = "prd"
         case releaseID = "rel"
         case releaseVersion = "ver"
@@ -54,7 +54,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public init(
         licenseID: String,
         activationID: String,
-        accountID: String,
+        instanceID: String,
         productID: String,
         releaseID: String,
         releaseVersion: String,
@@ -69,7 +69,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     ) {
         self.licenseID = licenseID
         self.activationID = activationID
-        self.accountID = accountID
+        self.instanceID = instanceID
         self.productID = productID
         self.releaseID = releaseID
         self.releaseVersion = releaseVersion
