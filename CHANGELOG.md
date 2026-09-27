@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-27
+
+### Changed
+- **Simplified SDK Configuration (`LicenKitConfiguration`)**:
+  - Removed client-side `instanceID` requirement; instance resolution is now managed entirely server-side via the globally unique `productID`.
+  - Replaced the `trustedSigningKeys: [String: String]` dictionary with a single `signingPublicKey: String?` property.
+  - Automatically derives `releaseVersion` from the host application bundle (`CFBundleShortVersionString`) and `releaseArch` (`arm64` / `x86_64`), with `releasePlatform` fixed to `macos`.
+  - Fixed internal HTTP request timeout to 15 seconds and encapsulated private Keychain access.
+- **V1 Token Claims & Alignment**:
+  - Aligned `TokenClaims` with the server specification: added `arc` (system architecture) and omitted client-side `rel` (Release ID) and `rat` (released at timestamp).
+  - Updated `ClaimsEvaluator` and `Ed25519Verifier` to verify the single configured signing key, product ID, bundle version, platform, and architecture.
+  - Aligned trial entitlement handling: unregistered product releases do not block trial access.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added
