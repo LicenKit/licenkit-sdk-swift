@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-27
+
 ### Added
 - Added `LicenKitResult<Value>` so Facade operations distinguish success, validation cooldown, and failure with the last known value.
 - Added `EntitlementSnapshot` and the unified License, Trial, activation-required, and Release-eligibility state model.
@@ -40,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implemented secure two-tier authentication architecture aligned with LicenKit server.
   - Local disk and Keychain scrub plaintext `licenseKey` upon activation and persist only `machineToken` and `machineId`.
   - Added `sub` claim to `LicenseClaims` with backwards-compatible `licenseKey` alias.
-  - Refactored `ApiValidateRequest` and `ApiDeactivateRequest` around the then-current tenant ID, machine ID, machine token, and fingerprint contract. The current contract is documented in `[Unreleased]` above.
+  - Refactored `ApiValidateRequest` and `ApiDeactivateRequest` around the then-current tenant ID, machine ID, machine token, and fingerprint contract. The current contract is documented in `[0.3.0]` above.
 - **High Availability Disaster Recovery & Resilience**:
   - Implemented `LicenKitRetryCoordinator` featuring dual-track execution:
     - **Track A (Foreground Blocking)**: `activate()` and `refresh()` with jittered exponential backoff (up to 3 retries) and immediate user feedback.
