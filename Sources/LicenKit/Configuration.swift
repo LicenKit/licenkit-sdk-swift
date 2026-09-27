@@ -2,31 +2,76 @@ import Foundation
 
 public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
-    public let instanceID: String
     public let productID: String
-    public let releaseVersion: String
-    public let releasePlatform: String
-    public let trustedSigningKeys: [String: String]
-    public let timeoutInterval: TimeInterval
-    public let accessGroup: String?
+    public let signingPublicKey: String?
+
+    let releaseVersion: String
+    let releasePlatform: String
+    let releaseArch: String
 
     public init(
         serverURL: URL,
-        instanceID: String,
         productID: String,
-        releaseVersion: String,
-        releasePlatform: String,
-        trustedSigningKeys: [String: String] = [:],
-        timeoutInterval: TimeInterval = 15,
-        accessGroup: String? = nil
+        signingPublicKey: String? = nil
     ) {
         self.serverURL = serverURL
-        self.instanceID = instanceID
         self.productID = productID
+        self.signingPublicKey = signingPublicKey
+        self.releaseVersion = Self.bundleReleaseVersion(Bundle.main) ?? ""
+        self.releasePlatform = "macos"
+        self.releaseArch = Self.bundleReleaseArchitecture(Bundle.main) ?? ""
+    }
+
+    init(
+        serverURL: URL,
+        productID: String,
+        signingPublicKey: String? = nil,
+        releaseVersion: String,
+        releasePlatform: String,
+        releaseArch: String
+    ) {
+        self.serverURL = serverURL
+        self.productID = productID
+        self.signingPublicKey = signingPublicKey
         self.releaseVersion = releaseVersion
         self.releasePlatform = releasePlatform
-        self.trustedSigningKeys = trustedSigningKeys
-        self.timeoutInterval = timeoutInterval
-        self.accessGroup = accessGroup
+        self.releaseArch = releaseArch
+    }
+
+    func requireBuildIdentity() throws -> (version: String, platform: String, arch: String) {
+        guard !releaseVersion.isEmpty else {
+            throw LicenKitError.configurationError(
+                reason: "The host App Bundle is missing CFBundleShortVersionString"
+            )
+        }
+        guard !releasePlatform.isEmpty else {
+            throw LicenKitError.configurationError(
+                reason: "The host App operating system could not be determined"
+            )
+        }
+        guard !releaseArch.isEmpty else {
+            throw LicenKitError.configurationError(
+                reason: "The host App executable architecture could not be determined"
+            )
+        }
+        return (releaseVersion, releasePlatform, releaseArch)
+    }
+
+    private static func bundleReleaseVersion(_ bundle: Bundle) -> String? {
+        guard let value = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
+            return nil
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func bundleReleaseArchitecture(_ bundle: Bundle) -> String? {
+        let architectures = Set((bundle.executableArchitectures ?? []).map(\.intValue))
+        let hasArm64 = architectures.contains(NSBundleExecutableArchitectureARM64)
+        let hasX86_64 = architectures.contains(NSBundleExecutableArchitectureX86_64)
+        if hasArm64 && hasX86_64 { return "universal" }
+        if hasArm64 { return "arm64" }
+        if hasX86_64 { return "x86_64" }
+        return nil
     }
 }

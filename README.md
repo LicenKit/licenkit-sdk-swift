@@ -16,13 +16,8 @@ LicenKit Swift SDK 是面向 macOS App 的 V1 授权客户端。它用同一个�
 ```swift
 let configuration = LicenKitConfiguration(
     serverURL: URL(string: "https://license.example.com")!,
-    instanceID: "ins_01...",
     productID: "prd_01...",
-    releaseVersion: "2.4.0",
-    releasePlatform: "macos-universal",
-    trustedSigningKeys: [
-        "key_01...": "base64-encoded-ed25519-public-key"
-    ]
+    signingPublicKey: "base64-encoded-ed25519-public-key"
 )
 
 LicenKit.configure(with: configuration)
@@ -38,6 +33,16 @@ case .failure(let error, let lastKnown, let metadata):
     print(error, lastKnown?.state as Any, metadata.requestID as Any)
 }
 ```
+
+公共初始化参数只有：
+
+- `serverURL`：LicenKit 服务根地址；
+- `productID`：Admin 产品页展示的全局唯一 Product ID；
+- `signingPublicKey`：Admin 产品页交付的 Ed25519 公钥。仅使用 `opaque` 凭证时可省略；使用 `signed` 凭证时必须提供。
+
+SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号；操作系统固定识别为 `macos`，主可执行文件架构单独推导为 `arm64`、`x86_64` 或 `universal`。这些值作为 `release_version + release_platform + release_arch` 随请求发送，但宿主业务代码不需要配置。缺少构建信息时操作会明确返回配置错误。网络超时固定为 SDK 内部的 15 秒；Keychain 只供当前 App 使用，不暴露 Access Group 配置。
+
+Product Release 不是所有授权的前置登记表。只有永久授权同时存在 `updates_until` 时，Server 才尝试用这组构建身份查询发布时间；未登记时按宽容策略继续放行，查到且 `released_at > updates_until` 时才返回需要更新权益。Signed License Token 不包含 Release ID 或发布时间，本地只验证签名、构建身份、设备绑定和 Token/License 自身期限。
 
 写操作也返回显式结果，不通过 `throws` 隐藏上次状态：
 

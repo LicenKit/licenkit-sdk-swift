@@ -7,19 +7,22 @@
 ```swift
 public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
-    public let instanceID: String
     public let productID: String
-    public let releaseVersion: String
-    public let releasePlatform: String
-    public let trustedSigningKeys: [String: String]
-    public let timeoutInterval: TimeInterval
-    public let accessGroup: String?
+    public let signingPublicKey: String?
+
+    public init(
+        serverURL: URL,
+        productID: String,
+        signingPublicKey: String? = nil
+    )
 }
 
 public final class LicenKit: @unchecked Sendable {
     public static let minimumValidationRequestInterval: TimeInterval
     public static func configure(with configuration: LicenKitConfiguration)
     public static var shared: LicenKit { get }
+
+    public init(configuration: LicenKitConfiguration)
 
     public var currentSnapshot: EntitlementSnapshot? { get }
 
@@ -36,7 +39,11 @@ public final class LicenKit: @unchecked Sendable {
 }
 ```
 
-`instanceID` 编码为 `instance_id`，并与 Signed License Token 的 `ins` Claim 匹配。旧 `accountID/account_id/acc` 不作为兼容别名接受。
+`productID` 是 Admin 产品页展示的全局唯一产品标识，Server 据此解析租户边界，客户端不再传入 `instanceID`。
+
+`signingPublicKey` 是 Admin 产品页交付的 Ed25519 公钥，支持原始 32 字节公钥的 Base64，或 Ed25519 SPKI PEM/Base64。仅使用 `opaque` 凭证时可以省略；`signed` 凭证需要它完成离线验签。当前公共 API 只接受一个公钥，不把服务端下载的数据自动提升为信任根。
+
+构建身份不再由业务代码传入。SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号，将操作系统标识为 `macos`，并根据主可执行文件架构单独推导 `arm64`、`x86_64` 或 `universal`；无法取得时返回 `.configurationError`。请求使用独立的 `release_version`、`release_platform` 与 `release_arch` 字段。请求超时固定为 SDK 内部的 15 秒，Keychain 使用当前 App 私有命名空间，不暴露 Access Group。
 
 `currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动后应调用 `validate()` 完成恢复与必要的联网校验。
 
@@ -113,17 +120,18 @@ public enum LicenseEntitlement: Codable, Equatable, Sendable {
 }
 
 public enum ReleaseEligibilityIssue: Codable, Equatable, Sendable {
-    case unknownRelease(code: String, version: String, platform: String)
     case updateRequired(
         code: String,
         updatesUntil: Date?,
         releaseVersion: String,
+        releasePlatform: String,
+        releaseArch: String,
         releasedAt: Date?
     )
 }
 ```
 
-对 active Product，未知 Release 使用顶层 `releaseNotEligible(.unknownRelease(...))`，不会归一化成 Trial 不可用。Product 不存在或已归档仍返回 `.failure` 中的服务端原始错误，而不是扩充 `TrialUnavailableReason`。
+`releaseNotEligible` 只表达 Server 已查到对应 Product Release，且它的发布时间晚于永久授权的 `updates_until`。没有登记 Release 时 Server 按宽容策略继续校验，不产生“未知版本”状态。Product 不存在或已归档仍返回 `.failure` 中的服务端原始错误，而不是扩充 `TrialUnavailableReason`。
 
 ## 快照、新鲜度与功能
 
@@ -216,7 +224,8 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
         kind: TransportErrorKind,
         underlyingDescription: String
     )
-    case missingTrustedSigningKey(keyID: String)
+    case configurationError(reason: String)
+    case missingSigningPublicKey(keyID: String)
     case invalidSignedLicenseToken(reason: String)
     case credentialStorageError(operation: String, status: Int32)
     case fingerprintError(reason: String)
@@ -245,11 +254,12 @@ HTTP 5xx 归为传输错误，但保留响应中的安全 `code/requestID/detail
 Token 是紧凑 JWS：
 
 - Header 固定要求 `alg=EdDSA`、`typ=licenkit-license+jwt` 与已知 `kid`；
-- Claims 要求 `lic`、`act`、`ins`、`prd`、`rel`、`ver`、`plt`、`rat`、`fp`、`iat`、`exp`、`lexp`、`upd`、`fea`；
-- `ins/prd/act/fp/ver/plt` 必须与当前 SDK 配置、Activation 和设备一致；
+- Claims 要求 `lic`、`act`、`ins`、`prd`、`ver`、`plt`、`arc`、`fp`、`iat`、`exp`、`lexp`、`upd`、`fea`；
+- `prd/act/fp/ver/plt/arc` 必须与当前 Product、Activation、设备和 SDK 自动读取的构建身份一致；`ins` 由 Server 签发并保留为服务端租户信息，不要求宿主 App 再配置一份；
 - 响应外层 Signed Token 到期时间必须与签名内绝对 `exp` 相同；
 - Active License 的 features、`updates_until` 和最终到期时间必须与签名 Claims 相同；
 - `lexp` 可为空表示永久 License；`upd` 可为空表示不限制未来版本；
+- Token 不携带 Product Release ID 或 `released_at`；更新权益是否覆盖当前版本由 Server 在线校验，SDK 不用 `upd` 在本地重复推导发布时间规则；
 - Claims 不包含 Registration Key。
 
 Plan 的 `signed_token_ttl_seconds` 只用于 Server 计算绝对 `exp`：它取“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值；billing 模式的最终截止时间已包含支付宽限。原始 TTL 不进入 Token，也不要求覆盖 3600 秒建议间隔。Token 先到期时，后续 `validate()` 绕过建议间隔但仍受 30 秒门槛。SDK 不从 Token 自报算法选择验证器，也不把运行时下载的公钥自动提升为信任根。

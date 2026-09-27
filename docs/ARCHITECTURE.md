@@ -13,8 +13,8 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
 - `LicenKitAPIClient`：实现 V1 JSON Envelope，区分传输错误、API 错误和协议错误，并保留 Request ID 与安全 details。
 - `EntitlementSnapshot`：统一保存业务状态、来源、新鲜度边界、业务码和诊断信息。
 - `CredentialStore` / `KeychainStore`：分别保存 License、Trial 与快照；秘密不进入普通偏好设置。
-- `Ed25519Verifier`：验证 `signed` 模式的紧凑 JWS 和受信 `kid`。
-- `ClaimsEvaluator`：核对 Instance、Product、Activation、设备、Release 与各层到期时间。
+- `Ed25519Verifier`：使用宿主内置的单个 Ed25519 公钥验证 `signed` 模式紧凑 JWS，并校验响应 Key ID 与 Token `kid` 一致。
+- `ClaimsEvaluator`：核对 Product、Activation、设备、版本、操作系统、架构与各层到期时间；Instance 由 Server 通过全局唯一 Product ID 解析。
 - `MacOSFingerprintProvider`：生成稳定设备指纹。
 
 ## 统一数据流
@@ -84,15 +84,16 @@ min(
 ```text
 online response
   ├─ opaque → 签名字段必须为空 → 保存在线凭据与快照
-  └─ signed → 内置 kid → Ed25519 验签 → Claims/Release/状态一致性 → 保存
+  └─ signed → 内置公钥 → Ed25519 验签 → Claims/构建身份/状态一致性 → 保存
 ```
 
-运行时从授权服务下载的公钥不能成为信任根。密钥轮换通过 App 同时内置新旧 key ID 实现；服务端撤销密钥不能瞬间改变完全离线设备上的旧 Token，风险窗口由 Token TTL 和受信 App 更新共同限制。
+运行时从授权服务下载的公钥不能成为信任根。当前 SDK 公共配置只接收一个由 Admin 交付、随 App 构建内置的公钥；当前产品模型也只有一个 active 签名密钥，不对宿主 App 暴露密钥字典或轮换接口。将来如果引入真实的密钥轮换，需要同时设计 Server 生命周期、Admin 操作和客户端多公钥迁移窗口，不能只把参数改回字典。
 
 Signed 模式还检查：
 
-- Token `ins` 与 SDK 的 `instanceID` 完全相同；旧 `acc` Claim 不接受；
-- `prd/act/fp/ver/plt` 与当前 Product、Activation、设备和构建一致；
+- Token 仍携带 Server 签发的 `ins`，旧 `acc` Claim 不接受；宿主 App 不再重复配置 Instance；
+- `prd/act/fp/ver/plt/arc` 与当前 Product、Activation、设备和自动读取的构建身份一致；
+- Token 不包含 Product Release ID 或发布时间；Release 发布时间只由 Server 在有限期更新权益校验中使用；
 - 外层 `signed_license_token_expires_at` 等于签名内 `exp`；
 - active License 的 features、更新期限与含支付宽限期的最终到期时间等于签名 Claims；
 - Token Payload 只包含绝对 `exp`，不包含 Plan 的 TTL 原值；`exp` 取“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值，TTL 可以短于 3600 秒建议间隔。
@@ -101,7 +102,7 @@ Signed 模式还检查：
 
 Trial Claim 与 License 凭据分别存储。首次领取使用 `/trials/claim`；后续统一校验使用 `credential.kind=trial`。Trial Token 不参与 Ed25519 验签。正常 License 激活并保存后清除同设备 Trial 凭据。
 
-没有本地凭据时，统一校验使用 `credential.kind=none`。对 active Product，它可以返回 Trial available、not enabled、already claimed 或 Release 不合格；Product 不存在/已归档和 Trial 配置损坏仍是失败，不伪装成 Trial 不可用。
+没有本地凭据时，统一校验使用 `credential.kind=none`。对 active Product，它可以返回 Trial available、not enabled 或 already claimed；Product Release 是否登记不影响 Trial。Product 不存在/已归档和 Trial 配置损坏仍是失败，不伪装成 Trial 不可用。
 
 ## 被动冷却边界
 

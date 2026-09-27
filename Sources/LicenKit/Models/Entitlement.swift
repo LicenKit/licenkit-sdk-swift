@@ -71,11 +71,12 @@ public enum LicenseEntitlement: Codable, Equatable, Sendable {
 }
 
 public enum ReleaseEligibilityIssue: Codable, Equatable, Sendable {
-    case unknownRelease(code: String, version: String, platform: String)
     case updateRequired(
         code: String,
         updatesUntil: Date?,
         releaseVersion: String,
+        releasePlatform: String,
+        releaseArch: String,
         releasedAt: Date?
     )
 }

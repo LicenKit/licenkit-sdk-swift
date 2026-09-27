@@ -205,6 +205,7 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
     public let trial: APITrialAvailability?
     public let releaseVersion: String?
     public let releasePlatform: String?
+    public let releaseArch: String?
     public let updatesUntil: FlexibleDate?
     public let releasedAt: FlexibleDate?
     public let details: [String: JSONValue]
@@ -214,6 +215,7 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
         case expiresAt = "expires_at"
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
+        case releaseArch = "release_arch"
         case updatesUntil = "updates_until"
         case releasedAt = "released_at"
     }
@@ -230,6 +232,7 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
         trial = try container.decodeIfPresent(APITrialAvailability.self, forKey: .trial)
         releaseVersion = try container.decodeIfPresent(String.self, forKey: .releaseVersion)
         releasePlatform = try container.decodeIfPresent(String.self, forKey: .releasePlatform)
+        releaseArch = try container.decodeIfPresent(String.self, forKey: .releaseArch)
         updatesUntil = try container.decodeIfPresent(FlexibleDate.self, forKey: .updatesUntil)
         releasedAt = try container.decodeIfPresent(FlexibleDate.self, forKey: .releasedAt)
         details = try container.decodeIfPresent([String: JSONValue].self, forKey: .details) ?? [:]
@@ -237,7 +240,6 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
 }
 
 public struct APIActivateRequest: Codable, Sendable {
-    public let instanceID: String
     public let productID: String
     public let licenseKey: String
     public let fingerprint: String
@@ -245,9 +247,9 @@ public struct APIActivateRequest: Codable, Sendable {
     public let name: String?
     public let releaseVersion: String
     public let releasePlatform: String
+    public let releaseArch: String
 
     enum CodingKeys: String, CodingKey {
-        case instanceID = "instance_id"
         case productID = "product_id"
         case licenseKey = "license_key"
         case fingerprint
@@ -255,6 +257,7 @@ public struct APIActivateRequest: Codable, Sendable {
         case name
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
+        case releaseArch = "release_arch"
     }
 }
 
@@ -314,19 +317,19 @@ public enum APIValidationCredential: Encodable, Equatable, Sendable {
 }
 
 public struct APIValidateRequest: Encodable, Sendable {
-    public let instanceID: String
     public let productID: String
     public let fingerprint: String
     public let releaseVersion: String
     public let releasePlatform: String
+    public let releaseArch: String
     public let credential: APIValidationCredential
 
     enum CodingKeys: String, CodingKey {
-        case instanceID = "instance_id"
         case productID = "product_id"
         case fingerprint
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
+        case releaseArch = "release_arch"
         case credential
     }
 }
@@ -358,14 +361,12 @@ public struct APIValidateResponse: Codable, Sendable {
 }
 
 public struct APIDeactivateRequest: Codable, Sendable {
-    public let instanceID: String
     public let productID: String
     public let activationID: String
     public let machineToken: String
     public let fingerprint: String
 
     enum CodingKeys: String, CodingKey {
-        case instanceID = "instance_id"
         case productID = "product_id"
         case activationID = "activation_id"
         case machineToken = "machine_token"
@@ -385,20 +386,20 @@ public struct APIDeactivateResponse: Codable, Sendable {
 }
 
 public struct APITrialClaimRequest: Codable, Sendable {
-    public let instanceID: String
     public let productID: String
     public let fingerprint: String
     public let devicePlatform: String
     public let releaseVersion: String
     public let releasePlatform: String
+    public let releaseArch: String
 
     enum CodingKeys: String, CodingKey {
-        case instanceID = "instance_id"
         case productID = "product_id"
         case fingerprint
         case devicePlatform = "device_platform"
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
+        case releaseArch = "release_arch"
     }
 }
 

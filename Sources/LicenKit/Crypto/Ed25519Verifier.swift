@@ -34,20 +34,20 @@ public struct Ed25519Verifier: Sendable {
 
     public func verifyAndDecodeToken(
         token: String,
-        trustedSigningKeys: [String: String]
+        signingPublicKey: String?
     ) throws -> (header: SignedLicenseTokenHeader, claims: LicenseClaims) {
         let parts = token.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3 else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "expected three JWS segments")
         }
         let header = try decodeProtectedHeader(token: token)
-        guard let publicKey = trustedSigningKeys[header.kid] else {
-            throw LicenKitError.missingTrustedSigningKey(keyID: header.kid)
+        guard let signingPublicKey, !signingPublicKey.isEmpty else {
+            throw LicenKitError.missingSigningPublicKey(keyID: header.kid)
         }
         guard let signature = decodeBase64URL(String(parts[2])), signature.count == 64 else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "signature must be 64-byte Base64URL Ed25519 data")
         }
-        let keyData = try extractRawEd25519PublicKey(from: publicKey)
+        let keyData = try extractRawEd25519PublicKey(from: signingPublicKey)
         let verifier: Curve25519.Signing.PublicKey
         do { verifier = try Curve25519.Signing.PublicKey(rawRepresentation: keyData) }
         catch { throw LicenKitError.invalidSignedLicenseToken(reason: "trusted Ed25519 public key is invalid") }
@@ -67,7 +67,7 @@ public struct Ed25519Verifier: Sendable {
             throw LicenKitError.invalidSignedLicenseToken(reason: "legacy tenant claim is not accepted")
         }
         let requiredClaims: Set<String> = [
-            "lic", "act", "ins", "prd", "rel", "ver", "plt", "rat", "fp", "iat", "exp", "lexp", "upd", "fea"
+            "lic", "act", "ins", "prd", "ver", "plt", "arc", "fp", "iat", "exp", "lexp", "upd", "fea"
         ]
         guard requiredClaims.isSubset(of: Set(payloadDictionary.keys)) else {
             let missing = requiredClaims.subtracting(Set(payloadDictionary.keys)).sorted().joined(separator: ",")

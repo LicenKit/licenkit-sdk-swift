@@ -16,15 +16,17 @@
 - Product/设备 Trial 首次使用 `/trials/claim`，后续通过统一校验；正常 License 激活后清除本地 Trial 凭据。
 - 解绑只在服务端确认后删除 License 凭据；本地无凭据时返回 `source=.local`、`wasDeactivated=false`，不伪造在线事实。
 - API 与业务状态保留原始 code、Request ID 和按字段脱敏的 details；网络失败不改写成到期、吊销或有效状态。
-- Instance 合同使用 `instanceID/instance_id/ins`；旧 Account 命名不作为兼容别名接受。
+- 公共初始化只需要 `serverURL`、`productID` 和可选单个 `signingPublicKey`；Server 通过全局唯一 Product ID 解析 Instance。
+- Release 版本来自宿主 App Bundle，平台固定为 `macos`，架构独立推导；请求超时固定为内部 15 秒，Keychain 不暴露 Access Group。
+- Signed Token 仍包含 Server 侧 `ins` Claim；旧 `acc` Claim 不接受，但客户端不再把 Instance 作为配置或请求字段。
 
 ## 本地合同测试已覆盖
 
-- 无凭据设备的 Trial available、not enabled、already claimed 和 unknown Release 映射，以及嵌套业务码保留。
+- 无凭据设备的 Trial available、not enabled、already claimed 映射，以及嵌套业务码保留；未登记 Release 不阻断 Trial。
 - License、Trial 与无凭据三种严格请求形状；旧的扁平 License 请求和独立 Trial 校验路径被拒绝。
 - License/Trial active 与全部业务终态映射，`businessCode/details` 不丢失。
 - 服务端 `validated_at`、空/过小/过大的建议间隔，以及业务/Token 到期对 freshness 的截断。
-- `opaque` 不要求公钥；`signed` 要求受信 `kid`，并验证 Instance、Product、Activation、设备、Release、`exp` 与服务端状态。
+- `opaque` 不要求公钥；`signed` 要求宿主内置的单个公钥，并验证响应 Key ID、Product、Activation、设备、版本、平台、架构、`exp` 与服务端状态。Token 不包含 Release ID 或发布时间。
 - Signed Token TTL 可以短于建议间隔；Payload 只写绝对 `exp`，实际时刻为“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值。外层到期时间与 `exp` 不一致、状态与 Claims 不一致时明确拒绝。
 - 普通双门槛、Signed Token 失效绕过建议间隔、30 秒硬门槛，以及四类 Server 结果对最近响应时间/`validatedAt` 的不同更新规则。
 - 同期 `validate()` 只发一个请求；激活、Trial 领取或解绑不会被旧校验响应覆盖。
@@ -40,7 +42,7 @@
 - CLI 与 Swift 对同一服务端状态给出同一可用性结论和原始业务码。
 - `request_id` 能关联真实 Worker 日志，且敏感凭据不会进入日志或分析系统。
 - 支付型订阅的 `expires_at` 已包含该 License 固化的宽限期，Swift 不重复叠加。
-- 已签名宿主 App 的 Keychain 读写、升级保留、卸载/重装与 Access Group 行为。
+- 已签名宿主 App 的私有 Keychain 读写、升级保留与卸载/重装行为。
 - Swift 包发布版本、Server 部署版本、D1 migration 和真实 Client API 联调完成。
 
 只有上述远端与发布验收完成，才能把状态从“本地实现可验证”提升为“生产可用”。

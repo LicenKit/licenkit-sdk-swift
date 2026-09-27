@@ -35,7 +35,16 @@ public final class LicenKit: @unchecked Sendable {
         return storedSnapshot
     }
 
-    public init(
+    public convenience init(configuration: LicenKitConfiguration) {
+        self.init(
+            configuration: configuration,
+            credentialStore: nil,
+            fingerprintProvider: nil,
+            apiClient: nil
+        )
+    }
+
+    init(
         configuration: LicenKitConfiguration,
         credentialStore: CredentialStore? = nil,
         fingerprintProvider: DeviceFingerprintProvider? = nil,
@@ -43,19 +52,13 @@ public final class LicenKit: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.configuration = configuration
-        self.credentialStore = credentialStore ?? KeychainStore(
-            productID: configuration.productID,
-            accessGroup: configuration.accessGroup
-        )
+        self.credentialStore = credentialStore ?? KeychainStore(productID: configuration.productID)
         #if os(macOS)
         self.fingerprintProvider = fingerprintProvider ?? MacOSFingerprintProvider()
         #else
         self.fingerprintProvider = fingerprintProvider ?? UnsupportedPlatformFingerprintProvider()
         #endif
-        self.apiClient = apiClient ?? LicenKitAPIClient(
-            serverURL: configuration.serverURL,
-            timeoutInterval: configuration.timeoutInterval
-        )
+        self.apiClient = apiClient ?? LicenKitAPIClient(serverURL: configuration.serverURL)
         self.now = now
     }
 
@@ -99,20 +102,21 @@ public final class LicenKit: @unchecked Sendable {
         var requestStarted = false
         var responseRequestID: String?
         do {
+            let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 setCurrentSnapshot(stored.snapshot)
             }
             requestStarted = true
             let response = try await apiClient.activate(request: APIActivateRequest(
-                instanceID: configuration.instanceID,
                 productID: configuration.productID,
                 licenseKey: licenseKey,
                 fingerprint: fingerprint,
                 devicePlatform: Self.devicePlatform,
                 name: machineName ?? ProcessInfo.processInfo.hostName,
-                releaseVersion: configuration.releaseVersion,
-                releasePlatform: configuration.releasePlatform
+                releaseVersion: build.version,
+                releasePlatform: build.platform,
+                releaseArch: build.arch
             ))
             responseRequestID = response.meta.requestID
 
@@ -161,6 +165,7 @@ public final class LicenKit: @unchecked Sendable {
         var requestStarted = false
         var responseRequestID: String?
         do {
+            let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 lastKnown = stored.snapshot
@@ -168,12 +173,12 @@ public final class LicenKit: @unchecked Sendable {
             }
             requestStarted = true
             let response = try await apiClient.claimTrial(request: APITrialClaimRequest(
-                instanceID: configuration.instanceID,
                 productID: configuration.productID,
                 fingerprint: fingerprint,
                 devicePlatform: Self.devicePlatform,
-                releaseVersion: configuration.releaseVersion,
-                releasePlatform: configuration.releasePlatform
+                releaseVersion: build.version,
+                releasePlatform: build.platform,
+                releaseArch: build.arch
             ))
             responseRequestID = response.meta.requestID
             guard response.status == "active",
@@ -231,6 +236,7 @@ public final class LicenKit: @unchecked Sendable {
         var confirmedResponseSnapshot: EntitlementSnapshot?
         var confirmedResponseSubject: StoredCredentialSubject?
         do {
+            let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
             validationFingerprint = fingerprint
             let license = try credentialStore.loadCredentials(for: fingerprint)
@@ -277,11 +283,11 @@ public final class LicenKit: @unchecked Sendable {
 
             requestStarted = true
             let response = try await apiClient.validate(request: APIValidateRequest(
-                instanceID: configuration.instanceID,
                 productID: configuration.productID,
                 fingerprint: fingerprint,
-                releaseVersion: configuration.releaseVersion,
-                releasePlatform: configuration.releasePlatform,
+                releaseVersion: build.version,
+                releasePlatform: build.platform,
+                releaseArch: build.arch,
                 credential: credential
             ))
             let responseReceivedAt = now()
@@ -417,7 +423,6 @@ public final class LicenKit: @unchecked Sendable {
 
             requestStarted = true
             let response = try await apiClient.deactivate(request: APIDeactivateRequest(
-                instanceID: configuration.instanceID,
                 productID: configuration.productID,
                 activationID: credentials.activationID,
                 machineToken: credentials.machineToken,
@@ -527,7 +532,7 @@ public final class LicenKit: @unchecked Sendable {
         }
         let (header, claims) = try verifier.verifyAndDecodeToken(
             token: token,
-            trustedSigningKeys: configuration.trustedSigningKeys
+            signingPublicKey: configuration.signingPublicKey
         )
         guard header.kid == responseKeyID else {
             throw LicenKitError.invalidSignedLicenseToken(
@@ -568,20 +573,10 @@ public final class LicenKit: @unchecked Sendable {
             guard datesEqual(expiresAt, signedExpiresAt) else {
                 throw LicenKitError.protocolError(reason: "License expiry state does not match signed claims")
             }
-        case (.releaseNotEligible(.updateRequired(_, let updatesUntil, let version, let releasedAt)),
-              .releaseNotEligible(.updateRequired(_, let signedUpdatesUntil, let signedVersion, let signedReleasedAt))):
-            guard datesEqual(updatesUntil, signedUpdatesUntil),
-                  version == signedVersion,
-                  datesEqual(releasedAt, signedReleasedAt) else {
-                throw LicenKitError.protocolError(
-                    reason: "Release eligibility state does not match signed claims"
-                )
-            }
         case (.license(.suspended), .active),
              (.license(.revoked), .active),
              (.license(.activationRevoked), .active),
-             (.license(.activationDeactivated), .active),
-             (.releaseNotEligible(.unknownRelease), .active):
+             (.license(.activationDeactivated), .active):
             break
         default:
             throw LicenKitError.protocolError(
@@ -758,26 +753,13 @@ public final class LicenKit: @unchecked Sendable {
             }
         case "release_not_eligible":
             switch state.status {
-            case "unknown_release":
-                try requireCode("PRODUCT_RELEASE_UNKNOWN", in: state)
-                guard let releaseVersion = state.releaseVersion,
-                      let releasePlatform = state.releasePlatform else {
-                    throw LicenKitError.protocolError(
-                        reason: "unknown Release state is missing release_version or release_platform"
-                    )
-                }
-                return .releaseNotEligible(
-                    .unknownRelease(
-                        code: "PRODUCT_RELEASE_UNKNOWN",
-                        version: releaseVersion,
-                        platform: releasePlatform
-                    )
-                )
             case "update_required":
                 try requireCode("UPDATE_ENTITLEMENT_REQUIRED", in: state)
-                guard let releaseVersion = state.releaseVersion else {
+                guard let releaseVersion = state.releaseVersion,
+                      let releasePlatform = state.releasePlatform,
+                      let releaseArch = state.releaseArch else {
                     throw LicenKitError.protocolError(
-                        reason: "update-required Release state is missing release_version"
+                        reason: "update-required Release state is missing its build identity"
                     )
                 }
                 return .releaseNotEligible(
@@ -785,6 +767,8 @@ public final class LicenKit: @unchecked Sendable {
                         code: "UPDATE_ENTITLEMENT_REQUIRED",
                         updatesUntil: state.updatesUntil?.date,
                         releaseVersion: releaseVersion,
+                        releasePlatform: releasePlatform,
+                        releaseArch: releaseArch,
                         releasedAt: state.releasedAt?.date
                     )
                 )

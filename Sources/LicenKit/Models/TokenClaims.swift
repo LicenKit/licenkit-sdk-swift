@@ -17,10 +17,9 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public let activationID: String
     public let instanceID: String
     public let productID: String
-    public let releaseID: String
     public let releaseVersion: String
     public let releasePlatform: String
-    public let releasedAtTimestamp: Int64
+    public let releaseArch: String
     public let fingerprint: String
     public let issuedAtTimestamp: Int64
     public let tokenExpiresAtTimestamp: Int64
@@ -33,10 +32,9 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         case activationID = "act"
         case instanceID = "ins"
         case productID = "prd"
-        case releaseID = "rel"
         case releaseVersion = "ver"
         case releasePlatform = "plt"
-        case releasedAtTimestamp = "rat"
+        case releaseArch = "arc"
         case fingerprint = "fp"
         case issuedAtTimestamp = "iat"
         case tokenExpiresAtTimestamp = "exp"
@@ -49,17 +47,14 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public var tokenExpiresAt: Date { Date(timeIntervalSince1970: TimeInterval(tokenExpiresAtTimestamp)) }
     public var licenseExpiresAt: Date? { licenseExpiresAtTimestamp.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
     public var updatesUntil: Date? { updatesUntilTimestamp.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
-    public var releasedAt: Date { Date(timeIntervalSince1970: TimeInterval(releasedAtTimestamp)) }
-
     public init(
         licenseID: String,
         activationID: String,
         instanceID: String,
         productID: String,
-        releaseID: String,
         releaseVersion: String,
         releasePlatform: String,
-        releasedAtTimestamp: Int64,
+        releaseArch: String,
         fingerprint: String,
         issuedAtTimestamp: Int64,
         tokenExpiresAtTimestamp: Int64,
@@ -71,10 +66,9 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         self.activationID = activationID
         self.instanceID = instanceID
         self.productID = productID
-        self.releaseID = releaseID
         self.releaseVersion = releaseVersion
         self.releasePlatform = releasePlatform
-        self.releasedAtTimestamp = releasedAtTimestamp
+        self.releaseArch = releaseArch
         self.fingerprint = fingerprint
         self.issuedAtTimestamp = issuedAtTimestamp
         self.tokenExpiresAtTimestamp = tokenExpiresAtTimestamp

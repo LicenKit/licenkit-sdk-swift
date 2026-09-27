@@ -3,11 +3,9 @@ import Security
 
 public struct KeychainStore: CredentialStore, Sendable {
     public let service: String
-    public let accessGroup: String?
 
-    public init(productID: String, accessGroup: String? = nil) {
+    public init(productID: String) {
         self.service = "com.licenkit.client.\(productID)"
-        self.accessGroup = accessGroup
     }
 
     public func loadCredentials(for fingerprint: String) throws -> StoredCredentials? {
@@ -47,13 +45,12 @@ public struct KeychainStore: CredentialStore, Sendable {
     }
 
     private func baseQuery(account: String) -> [String: Any] {
-        var query: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecAttrSynchronizable as String: kCFBooleanFalse as Any
         ]
-        if let accessGroup, !accessGroup.isEmpty { query[kSecAttrAccessGroup as String] = accessGroup }
         return query
     }
 

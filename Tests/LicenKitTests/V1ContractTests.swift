@@ -229,43 +229,34 @@ final class V1ContractTests: XCTestCase {
         }
     }
 
-    func testReleaseFailuresAreNotLicenseExpiry() async throws {
-        let cases: [([String: Any], EntitlementState)] = [
-            ([
-                "kind": "release_not_eligible", "status": "unknown_release",
-                "code": "PRODUCT_RELEASE_UNKNOWN", "release_version": "2.4.0",
-                "release_platform": "macos-arm64"
-            ], .releaseNotEligible(.unknownRelease(
-                code: "PRODUCT_RELEASE_UNKNOWN", version: "2.4.0", platform: "macos-arm64"
-            ))),
-            ([
-                "kind": "release_not_eligible", "status": "update_required",
-                "code": "UPDATE_ENTITLEMENT_REQUIRED", "updates_until": "2029-01-01T00:00:00Z",
-                "release_version": "2.4.0", "released_at": "2030-01-01T00:00:00Z"
-            ], .releaseNotEligible(.updateRequired(
-                code: "UPDATE_ENTITLEMENT_REQUIRED",
-                updatesUntil: FlexibleDate.parseISO8601("2029-01-01T00:00:00Z"),
-                releaseVersion: "2.4.0",
-                releasedAt: validatedAt
-            ))),
+    func testUpdateRequiredIsNotLicenseExpiry() async throws {
+        let state: [String: Any] = [
+            "kind": "release_not_eligible", "status": "update_required",
+            "code": "UPDATE_ENTITLEMENT_REQUIRED", "updates_until": "2029-01-01T00:00:00Z",
+            "release_version": "2.4.0", "release_platform": "macos", "release_arch": "arm64",
+            "released_at": "2030-01-01T00:00:00Z"
         ]
-        for (state, expected) in cases {
-            setJSONResponse(data: validateData(state: state))
-            let result = await makeClient(store: MemoryCredentialStore()).validate()
-            guard case .success(let snapshot, _) = result else { return XCTFail("Expected success") }
-            XCTAssertEqual(snapshot.state, expected)
-        }
+        let expected = EntitlementState.releaseNotEligible(.updateRequired(
+            code: "UPDATE_ENTITLEMENT_REQUIRED",
+            updatesUntil: FlexibleDate.parseISO8601("2029-01-01T00:00:00Z"),
+            releaseVersion: "2.4.0",
+            releasePlatform: "macos",
+            releaseArch: "arm64",
+            releasedAt: validatedAt
+        ))
+        setJSONResponse(data: validateData(state: state))
+        let result = await makeClient(store: MemoryCredentialStore()).validate()
+        guard case .success(let snapshot, _) = result else { return XCTFail("Expected success") }
+        XCTAssertEqual(snapshot.state, expected)
     }
 
     func testReleaseStatesRejectMissingIdentityFields() async throws {
         let states: [[String: Any]] = [
-            [
-                "kind": "release_not_eligible", "status": "unknown_release",
-                "code": "PRODUCT_RELEASE_UNKNOWN", "release_version": "2.4.0"
-            ],
+            ["kind": "release_not_eligible", "status": "update_required", "code": "UPDATE_ENTITLEMENT_REQUIRED"],
             [
                 "kind": "release_not_eligible", "status": "update_required",
-                "code": "UPDATE_ENTITLEMENT_REQUIRED"
+                "code": "UPDATE_ENTITLEMENT_REQUIRED", "release_version": "2.4.0",
+                "release_platform": "macos"
             ],
         ]
         for state in states {
@@ -620,7 +611,7 @@ final class V1ContractTests: XCTestCase {
         let result = await makeClient(
             store: store,
             clock: clock,
-            keys: ["key_1": key.publicKey.rawRepresentation.base64EncodedString()]
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         ).validate()
         guard case .notPerformed(.cooldown, let cached, _) = result else {
             return XCTFail("A valid Signed License must obey the configured interval")
@@ -658,7 +649,7 @@ final class V1ContractTests: XCTestCase {
         let client = makeClient(
             store: store,
             clock: clock,
-            keys: ["key_1": key.publicKey.rawRepresentation.base64EncodedString()]
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         )
         guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
             return XCTFail("Expired Signed credentials must still obey the 30-second throttle")
@@ -708,7 +699,7 @@ final class V1ContractTests: XCTestCase {
         let client = makeClient(
             store: store,
             clock: clock,
-            keys: ["key_1": unrelatedKey.publicKey.rawRepresentation.base64EncodedString()]
+            signingPublicKey: unrelatedKey.publicKey.rawRepresentation.base64EncodedString()
         )
         guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
             return XCTFail("A locally invalid signature must still obey the 30-second throttle")
@@ -747,7 +738,7 @@ final class V1ContractTests: XCTestCase {
         let client = makeClient(
             store: store,
             clock: clock,
-            keys: ["key_1": key.publicKey.rawRepresentation.base64EncodedString()]
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         )
         guard case .failure(.apiError(let status, let code, _, let requestID, _), _, _) = await client.validate() else {
             return XCTFail("Expected HTTP 401 API failure")
@@ -775,7 +766,7 @@ final class V1ContractTests: XCTestCase {
 
     func testSignedOuterExpiryAndStateMustMatchVerifiedClaims() async throws {
         let key = Curve25519.Signing.PrivateKey()
-        let keys = ["key_1": key.publicKey.rawRepresentation.base64EncodedString()]
+        let signingPublicKey = key.publicKey.rawRepresentation.base64EncodedString()
         let exp = validatedAt.addingTimeInterval(7_200)
         let token = try makeToken(privateKey: key, tokenExpiry: exp, features: ["export"])
         var mismatchedExpiry = activationData(
@@ -783,7 +774,7 @@ final class V1ContractTests: XCTestCase {
         )
         setJSONResponse(data: mismatchedExpiry)
         let store = MemoryCredentialStore()
-        let first = await makeClient(store: store, keys: keys).activate(licenseKey: "LK")
+        let first = await makeClient(store: store, signingPublicKey: signingPublicKey).activate(licenseKey: "LK")
         guard case .failure(.protocolError(let reason), _, let metadata) = first else {
             return XCTFail("Expected signed exp mismatch failure")
         }
@@ -796,7 +787,7 @@ final class V1ContractTests: XCTestCase {
             stateFeatures: ["different"]
         )
         setJSONResponse(data: mismatchedExpiry)
-        let second = await makeClient(store: store, keys: keys).activate(licenseKey: "LK")
+        let second = await makeClient(store: store, signingPublicKey: signingPublicKey).activate(licenseKey: "LK")
         guard case .failure(.protocolError(let reason), _, _) = second else {
             return XCTFail("Expected signed state mismatch failure")
         }
@@ -804,7 +795,7 @@ final class V1ContractTests: XCTestCase {
         XCTAssertNil(try store.loadCredentials(for: fingerprint))
     }
 
-    func testSignedTokenRejectsLegacyTenantClaimAndInstanceMismatch() throws {
+    func testSignedTokenRejectsLegacyTenantClaimAndProductMismatch() throws {
         let key = Curve25519.Signing.PrivateKey()
         let verifier = Ed25519Verifier()
         let legacy = try makeToken(
@@ -814,20 +805,20 @@ final class V1ContractTests: XCTestCase {
         )
         XCTAssertThrowsError(try verifier.verifyAndDecodeToken(
             token: legacy,
-            trustedSigningKeys: ["key_1": key.publicKey.rawRepresentation.base64EncodedString()]
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         ))
 
         let claims = LicenseClaims(
             licenseID: "lic_1", activationID: "act_1", instanceID: "ins_other",
-            productID: "prd_1", releaseID: "rel_1", releaseVersion: "2.4.0",
-            releasePlatform: "macos-arm64", releasedAtTimestamp: Int64(validatedAt.timeIntervalSince1970),
+            productID: "prd_other", releaseVersion: "2.4.0",
+            releasePlatform: "macos", releaseArch: "arm64",
             fingerprint: fingerprint, issuedAtTimestamp: Int64(validatedAt.timeIntervalSince1970),
             tokenExpiresAtTimestamp: Int64(validatedAt.addingTimeInterval(7_200).timeIntervalSince1970),
             licenseExpiresAtTimestamp: nil, updatesUntilTimestamp: nil, features: ["export"]
         )
         XCTAssertThrowsError(try ClaimsEvaluator().evaluate(
             claims: claims,
-            configuration: configuration(keys: [:]),
+            configuration: configuration(signingPublicKey: nil),
             activationID: "act_1",
             currentFingerprint: fingerprint,
             now: validatedAt
@@ -1108,10 +1099,10 @@ final class V1ContractTests: XCTestCase {
     private func makeClient(
         store: MemoryCredentialStore,
         clock: MutableClock? = nil,
-        keys: [String: String] = [:]
+        signingPublicKey: String? = nil
     ) -> LicenKit {
         let clock = clock ?? MutableClock(validatedAt.addingTimeInterval(10))
-        let configuration = configuration(keys: keys)
+        let configuration = configuration(signingPublicKey: signingPublicKey)
         return LicenKit(
             configuration: configuration,
             credentialStore: store,
@@ -1121,14 +1112,14 @@ final class V1ContractTests: XCTestCase {
         )
     }
 
-    private func configuration(keys: [String: String]) -> LicenKitConfiguration {
+    private func configuration(signingPublicKey: String?) -> LicenKitConfiguration {
         LicenKitConfiguration(
             serverURL: URL(string: "https://mock.example")!,
-            instanceID: "ins_1",
             productID: "prd_1",
+            signingPublicKey: signingPublicKey,
             releaseVersion: "2.4.0",
-            releasePlatform: "macos-arm64",
-            trustedSigningKeys: keys
+            releasePlatform: "macos",
+            releaseArch: "arm64"
         )
     }
 
@@ -1314,8 +1305,8 @@ final class V1ContractTests: XCTestCase {
     ) throws -> String {
         let header = SignedLicenseTokenHeader(kid: "key_1")
         var payload: [String: Any] = [
-            "lic": "lic_1", "act": "act_1", "ins": "ins_1", "prd": "prd_1", "rel": "rel_1",
-            "ver": "2.4.0", "plt": "macos-arm64", "rat": Int64(validatedAt.timeIntervalSince1970),
+            "lic": "lic_1", "act": "act_1", "ins": "ins_1", "prd": "prd_1",
+            "ver": "2.4.0", "plt": "macos", "arc": "arm64",
             "fp": fingerprint, "iat": Int64(validatedAt.timeIntervalSince1970),
             "exp": Int64(tokenExpiry.timeIntervalSince1970), "lexp": NSNull(), "upd": NSNull(),
             "fea": features

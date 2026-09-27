@@ -3,7 +3,6 @@ import Foundation
 enum SignedLicenseEvaluation: Equatable, Sendable {
     case active(claims: LicenseClaims)
     case licenseExpired(expiresAt: Date)
-    case releaseNotEligible(ReleaseEligibilityIssue)
 }
 
 struct ClaimsEvaluator: Sendable {
@@ -15,9 +14,6 @@ struct ClaimsEvaluator: Sendable {
         currentFingerprint: String,
         now: Date = Date()
     ) throws -> SignedLicenseEvaluation {
-        guard claims.instanceID == configuration.instanceID else {
-            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token instance does not match SDK configuration")
-        }
         guard claims.productID == configuration.productID else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token product does not match SDK configuration")
         }
@@ -28,7 +24,8 @@ struct ClaimsEvaluator: Sendable {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token fingerprint does not match this device")
         }
         guard claims.releaseVersion == configuration.releaseVersion,
-              claims.releasePlatform == configuration.releasePlatform else {
+              claims.releasePlatform == configuration.releasePlatform,
+              claims.releaseArch == configuration.releaseArch else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token release identity does not match this build")
         }
         guard claims.issuedAt <= now.addingTimeInterval(300) else {
@@ -39,16 +36,6 @@ struct ClaimsEvaluator: Sendable {
         }
         if let licenseExpiration = claims.licenseExpiresAt, licenseExpiration <= now {
             return .licenseExpired(expiresAt: licenseExpiration)
-        }
-        if let updatesUntil = claims.updatesUntil, claims.releasedAt > updatesUntil {
-            return .releaseNotEligible(
-                .updateRequired(
-                    code: "UPDATE_ENTITLEMENT_REQUIRED",
-                    updatesUntil: updatesUntil,
-                    releaseVersion: claims.releaseVersion,
-                    releasedAt: claims.releasedAt
-                )
-            )
         }
         return .active(claims: claims)
     }

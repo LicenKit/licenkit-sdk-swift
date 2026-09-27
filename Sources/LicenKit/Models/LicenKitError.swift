@@ -20,7 +20,8 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
         details: [String: String]
     )
     case transportError(kind: TransportErrorKind, underlyingDescription: String)
-    case missingTrustedSigningKey(keyID: String)
+    case configurationError(reason: String)
+    case missingSigningPublicKey(keyID: String)
     case invalidSignedLicenseToken(reason: String)
     case credentialStorageError(operation: String, status: Int32)
     case fingerprintError(reason: String)
@@ -36,8 +37,10 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
             return "LicenKit API error HTTP \(statusCode) [\(code)]\(requestID.map { " request=\($0)" } ?? ""): \(message)"
         case .transportError(_, let description):
             return "LicenKit transport error: \(description)"
-        case .missingTrustedSigningKey(let keyID):
-            return "No trusted signing key is embedded for key ID '\(keyID)'."
+        case .configurationError(let reason):
+            return "LicenKit configuration is invalid: \(reason)"
+        case .missingSigningPublicKey(let keyID):
+            return "No signing public key is embedded for key ID '\(keyID)'."
         case .invalidSignedLicenseToken(let reason):
             return "Signed License Token is invalid: \(reason)"
         case .credentialStorageError(let operation, let status):
