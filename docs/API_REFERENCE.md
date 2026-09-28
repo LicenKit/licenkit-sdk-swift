@@ -32,9 +32,10 @@ public final class LicenKit: @unchecked Sendable {
     ) async -> LicenKitResult<ActivationData>
 
     public func startTrial() async -> LicenKitResult<EntitlementSnapshot>
+    public func restoreLocalEntitlement() async -> LocalEntitlementResult
     public func validate(trigger: ValidationTrigger) async -> LicenKitResult<EntitlementSnapshot>
     @available(*, deprecated) public func validate() async -> LicenKitResult<EntitlementSnapshot>
-    public func deactivate() async -> LicenKitResult<DeactivationData>
+    public func deactivate() async -> DeactivationResult
     public func hasFeature(_ feature: String) -> Bool
     public func getMachineFingerprint() async throws -> String
 }
@@ -46,7 +47,31 @@ public final class LicenKit: @unchecked Sendable {
 
 构建身份不再由业务代码传入。SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号，将操作系统标识为 `macos`，并根据主可执行文件架构单独推导 `arm64`、`x86_64` 或 `universal`；无法取得时返回 `.configurationError`。请求使用独立的 `release_version`、`release_platform` 与 `release_arch` 字段。请求超时固定为 SDK 内部的 15 秒，Keychain 使用当前 App 私有命名空间，不暴露 Access Group。
 
-`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动、进入前台、网络恢复时调用 `validate(trigger: .silent)`；用户点击“检查授权”“重试”，或因用户操作需要立即刷新授权时调用 `validate(trigger: .userInitiated)`。无参数 `validate()` 暂时按 `.silent` 执行，并已弃用；迁移时应显式标注调用意图。
+`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain，也不能单独作为冷启动放行依据。App 启动时先等待 `restoreLocalEntitlement()` 的本机结论，再在后台调用 `validate(trigger: .silent)`；进入前台、网络恢复时也可静默复核。用户点击“检查授权”“重试”时调用 `validate(trigger: .userInitiated)`。无参数 `validate()` 暂时按 `.silent` 执行，并已弃用。
+
+### 冷启动本机结论
+
+```swift
+public enum LocalEntitlementResult: Equatable, Sendable {
+    case usable(snapshot: EntitlementSnapshot)
+    case confirmedBlocked(snapshot: EntitlementSnapshot)
+    case verificationRequired(reason: LocalEvidenceIssue)
+}
+
+public enum LocalEvidenceIssue: Equatable, Sendable {
+    case noCredential
+    case noMatchingSnapshot
+    case expired
+    case invalidCredential(LicenKitError)
+    case storageFailure(LicenKitError)
+    case invalidSnapshot(LicenKitError)
+    case deactivationPending(phase: DeactivationAttemptPhase)
+}
+```
+
+本机调用自身不发网络请求；它与其他 SDK 操作按调用顺序串行，因此冷启动时应先等待本机结论，再启动在线复核。本机结论不代替后续在线复核。`.usable` 只在当前凭据与 SDK 保存的服务端快照绑定、业务期限未到，且 Signed 凭据通过签名、设备、构建身份与快照一致性校验时返回。`.confirmedBlocked` 仅恢复此前保存的服务端业务阻断。无凭据、凭据与快照不匹配、旧版未保存绑定的快照、Keychain 错误、业务期限已到或远端已确认解绑但本机尚未清理，都不能从本机证据放行；原始错误随 `LocalEvidenceIssue` 保留。解绑请求的远端结果未知时，已有可信本机授权仍可恢复，待确认记录继续保存。旧快照会在后续成功在线复核后写入新的绑定记录。
+
+`opaque` License 和 Trial 的本机证据依赖 SDK 曾写入 Keychain 的服务端快照与凭据一致性；它们没有可独立验签的权益载荷。远端解绑已确认且没有剩余 Trial 时，本机恢复可返回 `.confirmedBlocked`，但快照仍标记 `source=.local`：它表示依据远端解绑事实构造的“需要激活”，不宣称 Server 已确认 Trial 资格。宿主应把该结果映射到自己的访问决策，随后消费 `validate(trigger:)` 的结果；`notPerformed.cachedValue` 和 `failure.lastKnownValue` 只提供上下文，不能替代本机证据判定。
 
 ## 操作结果
 
@@ -179,9 +204,9 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
 
 请求门槛与业务新鲜度分开保存。固定 30 秒从持久化的最近一次实际 `/validate` 请求发出时间计算；请求即使超时、断网或收到非法正文，也会启动这条门槛。升级前没有请求记录的旧快照暂用 `lastValidateResponseAt` 保留其尚未结束的 30 秒窗口。Product 间隔只在静默调用时，从 `lastValidateResponseAt` 计算；合法业务成功与明确 HTTP 失败推进该时间，无 HTTP 响应与非法 2xx 正文不推进。HTTP 失败不推进 `validatedAt`。
 
-用户主动调用始终豁免 Product 间隔。静默调用在缓存的 active Trial/License 首次跨过已知业务截止时间、宿主 Release 版本/平台/架构变化后首次复核，或 Signed Token 本地失效时也豁免。到期和构建身份变化的豁免只各触发一次请求尝试；收到服务端到期终态或一次失败后，不因同一个事实持续静默请求。旧快照缺少构建身份时允许一次提前复核；该迁移不会自行改变缓存授权的可用性。缺少或无效的内置签名公钥属于配置错误，保留原始诊断，不靠在线重试修复。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
+用户主动调用始终豁免 Product 间隔。静默调用在缓存的 active Trial/License 首次跨过已知业务截止时间、宿主 Release 版本/平台/架构变化后首次复核，或 Signed Token 本地失效时也豁免。已缓存的 active Signed License 因时间流逝跨过签名 Claims 中相同的业务截止时间时，先停止本机放行，再进入在线复核；真正的签名、字段或快照不一致仍保留原始错误。到期和构建身份变化的豁免只各触发一次请求尝试；收到服务端到期终态或一次失败后，不因同一个事实持续静默请求。旧快照缺少构建身份时允许一次提前复核；该迁移不会自行改变缓存授权的可用性。缺少或无效的内置签名公钥属于配置错误，保留原始诊断，不靠在线重试修复。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
 
-自定义 `CredentialStore` 实现需要读写 `StoredValidationAttempt`；该记录按 Product 与设备指纹保存请求发出时间及当前 Release 身份，不包含 License Key 或 Token。`StoredEntitlementSnapshot.validatedBuild` 是可选字段，以便解码升级前的快照。
+自定义 `CredentialStore` 实现需要读写 `StoredValidationAttempt` 与 `StoredDeactivationAttempt`。前者按 Product 与设备指纹保存请求发出时间及当前 Release 身份，不包含 License Key 或 Token；后者在 Keychain 中保存解绑恢复所需的 Activation ID、Machine Token、阶段与可用的 Request ID。`StoredEntitlementSnapshot.validatedBuild`、`credentialBinding` 与 `confirmedRemoteDeactivation` 均为可选字段，以便解码升级前的快照；缺少凭据绑定时不会立即提供本机可用结论。
 
 `businessCode` 与 `details` 保存业务终态的原始诊断信息；其中敏感字段按字段递归脱敏。
 
@@ -198,9 +223,29 @@ public struct DeactivationData: Equatable, Sendable {
     public let wasDeactivated: Bool
     public let snapshot: EntitlementSnapshot
 }
+
+public enum DeactivationResult: Equatable, Sendable {
+    case success(value: DeactivationData, metadata: OperationMetadata)
+    case remoteConfirmedLocalRepairRequired(
+        stage: DeactivationRepairStage,
+        error: LicenKitError,
+        metadata: OperationMetadata
+    )
+    case failure(
+        error: LicenKitError,
+        remoteOutcome: DeactivationRemoteOutcome,
+        lastKnownSnapshot: EntitlementSnapshot?,
+        metadata: OperationMetadata,
+        localRecoveryError: LicenKitError?
+    )
+}
 ```
 
-本地没有 License 凭据时，`deactivate()` 返回成功的 `wasDeactivated=false` 和 `source=.local` 快照；它不会声称发生过远端解绑。远端失败时返回 `.failure` 并保留凭据。
+本地没有 License 凭据且没有待恢复记录时，`deactivate()` 返回成功的 `wasDeactivated=false`；已有的无凭据服务端阻断或远端解绑确认记录会保留，否则返回 `source=.local` 的新快照。它不会声称本次发生了远端解绑。请求前无法保存恢复记录时返回 `remoteOutcome=.notRequested`，且不发请求。收到明确的 4xx 拒绝时返回 `.rejected`，尝试清除恢复记录并保留原凭据；若清理记录也失败，`localRecoveryError` 单独保留该错误。请求已发出但没有可靠确认时返回 `.unknown`，恢复记录在重启后仍可用于重试 `deactivate()`，使用原 Machine Token 确认远端结果；已有可信本机授权可以继续使用，并可调用 `validate(trigger:)` 更新授权状态。
+
+远端确认后如清凭据、读取剩余 Trial 或保存快照失败，返回 `.remoteConfirmedLocalRepairRequired`，其中的 `stage`、原始 `error` 和 `metadata.requestID` 分别表达失败步骤、本地错误和远端请求。失败分支的 `lastKnownSnapshot` 仅用于诊断，不携带可能被误解为本次结果的 `wasDeactivated=false`。重试 `deactivate()` 会完成本机清理；服务端已确认的重复解绑是可重试的。远端已确认而恢复记录未清除前，`restoreLocalEntitlement()` 返回 `.deactivationPending`；待确认或已确认的恢复记录会阻止新的激活与 Trial 领取，以便先完成解绑恢复。
+
+如果写入“远端已确认”阶段本身失败，当前进程仍返回带原始错误与 Request ID 的 `.remoteConfirmedLocalRepairRequired(stage: .recordConfirmation)`，并立即撤销进程内旧授权。重启后持久化记录只剩“请求已发出”，无法从本机判断服务端是否已完成解绑；按待确认策略，旧的可信本机授权可能暂时恢复。此时重试 `deactivate()` 会用原 Machine Token 再次确认服务端结果。若本机存储一直不可写，SDK 无法跨进程可靠保存远端确认事实。
 
 ## License Terms
 

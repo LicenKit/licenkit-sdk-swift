@@ -26,6 +26,7 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
     case credentialStorageError(operation: String, status: Int32)
     case fingerprintError(reason: String)
     case protocolError(reason: String)
+    case deactivationRecoveryRequired(phase: DeactivationAttemptPhase)
 
     public var errorDescription: String? {
         switch self {
@@ -49,6 +50,8 @@ public enum LicenKitError: Error, LocalizedError, Equatable, Sendable {
             return "Device fingerprint failed: \(reason)"
         case .protocolError(let reason):
             return "LicenKit protocol error: \(reason)"
+        case .deactivationRecoveryRequired(let phase):
+            return "A deactivation attempt is \(phase.rawValue); retry deactivate() to finish recovery."
         }
     }
 

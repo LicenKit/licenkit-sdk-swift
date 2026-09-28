@@ -8,11 +8,11 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
 
 ## 模块职责
 
-- `LicenKit`：面向宿主 App 的 Facade，组织激活、统一校验、Trial 领取、解绑和快照读取，不包含 UI。
+- `LicenKit`：面向宿主 App 的 Facade，组织激活、本机证据恢复、在线复核、Trial 领取和解绑，不包含 UI。
 - `OperationCoordinator`：顺序化会修改凭据或快照的操作；同期实际校验请求共享同一 Task，静默跳过不会吞掉用户主动校验。
 - `LicenKitAPIClient`：实现 V1 JSON Envelope，区分传输错误、API 错误和协议错误，并保留 Request ID 与安全 details。
 - `EntitlementSnapshot`：统一保存业务状态、来源、新鲜度边界、业务码和诊断信息。
-- `CredentialStore` / `KeychainStore`：分别保存 License、Trial、快照和最近一次校验请求尝试；秘密不进入普通偏好设置。
+- `CredentialStore` / `KeychainStore`：分别保存 License、Trial、与凭据绑定的快照、最近一次校验请求尝试和解绑恢复记录；秘密不进入普通偏好设置。
 - `Ed25519Verifier`：使用宿主内置的单个 Ed25519 公钥验证 `signed` 模式紧凑 JWS，并校验响应 Key ID 与 Token `kid` 一致。
 - `ClaimsEvaluator`：核对 Product、Activation、设备、版本、操作系统、架构与各层到期时间；Instance 由 Server 通过全局唯一 Product ID 解析。
 - `MacOSFingerprintProvider`：生成稳定设备指纹。
@@ -21,6 +21,8 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
 
 ```text
 宿主 App
+  │
+  ├─ restoreLocalEntitlement → 本机可信结论 → 宿主访问决策
   │
   ├─ activate / startTrial / deactivate ─┐
   │                                      ├─ OperationCoordinator
@@ -38,14 +40,15 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
                                       └─ credential_update：仅 License
 ```
 
-所有凭据和快照写入都位于同一顺序化边界内。这样一次较早开始的校验不会在激活、Trial 领取或解绑之后才写回旧状态。同步的进程内 `currentSnapshot` 由锁保护；持久化来源仍是 Keychain。
+本机恢复与所有凭据和快照写入位于同一顺序化边界内。宿主先等待本机结果，再启动在线复核；本机恢复本身不发请求。这样一次较早开始的校验不会在激活、Trial 领取或解绑之后才写回旧状态。同步的进程内 `currentSnapshot` 由锁保护，但它不是独立的冷启动放行依据；持久化来源仍是 Keychain。
 
 ## 结果层与状态层
 
-SDK 分两层表达事实：
+SDK 分三层表达事实：
 
-1. `LicenKitResult` 回答“本次操作发生了什么”：成功、因冷却未执行，或失败。
-2. `EntitlementSnapshot.state` 回答“授权业务事实是什么”：需要激活、Trial、License、Release 不合格或未知。
+1. `LocalEntitlementResult` 回答“现有本机证据能否立即使用”：可用、已确认阻断，或需要核验。
+2. `LicenKitResult` 回答“本次在线复核或领取、激活操作发生了什么”：成功、因间隔未执行，或失败；解绑另用 `DeactivationResult` 表达远端确认与本地清理阶段。
+3. `EntitlementSnapshot.state` 回答“授权业务事实是什么”：需要激活、Trial、License、Release 不合格或未知。
 
 服务端认证凭据后得到的到期、暂停、吊销和 Activation 失效属于业务状态，因此返回 `.success(snapshot)`；无效凭据、Product 不存在/已归档、Trial 配置损坏、传输和协议问题属于 `.failure`。失败结果可以携带 `lastKnownValue`，但不会篡改成新的业务状态。
 
@@ -91,6 +94,10 @@ Signed 模式还检查：
 - Token 不包含 Product Release ID 或发布时间；Release 发布时间只由 Server 在有限期更新权益校验中使用；
 - active License 的 features、更新期限与含支付宽限期的最终到期时间等于签名 Claims；
 - Token Payload 不包含 `exp`；业务到期由 `lexp` 表达，在线复核间隔和离线宽限期通过响应元数据表达。
+
+本机恢复要求保存的服务端快照与当前 License/Trial 凭据绑定。绑定值由 Product、设备指纹、凭据身份和 Token 计算，避免同类型旧快照配合另一份凭据放行；升级前缺少绑定的旧快照需要先在线复核。`opaque` 与 Trial 不具有可离线验签的权益载荷，本机结论基于 Keychain 中 SDK 曾保存的凭据和服务端快照。Signed License 跨过相同的业务到期日时，本机停止放行，已缓存的 active 状态仍可进入在线复核；真实签名或字段不一致继续报告原始错误。
+
+解绑先保存包含原 Machine Token 的恢复记录，再请求 Server。收到明确确认后立即撤销进程内旧 License 的放行资格，接着保存已确认阶段、清凭据、写后续快照并清恢复记录；任何后续失败都返回远端已确认和具体本地错误。成功写入的本机 `activationRequired` 仍保留 `.local` 来源，另在持久化记录中标识远端解绑已确认，使重启后的本机判定能够恢复阻断，又不会伪称 Server 已判定 Trial 资格。响应丢失时记录保持待确认，可在重启后凭原 Token 重试；Server 对已解绑的同一 Activation 返回已解绑状态。待确认期间仍按已有可信本机证据恢复使用资格，并允许在线复核更新状态；远端确认后本机不再使用旧快照放行。新的激活与 Trial 领取须等待 `deactivate()` 完成恢复。
 
 ## Trial 与无凭据状态
 

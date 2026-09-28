@@ -76,19 +76,45 @@ public struct StoredValidationAttempt: Codable, Equatable, Sendable {
     }
 }
 
+public enum DeactivationAttemptPhase: String, Codable, Equatable, Sendable {
+    case requested
+    case confirmed
+}
+
+public struct StoredDeactivationAttempt: Codable, Equatable, Sendable {
+    public let activationID: String
+    public let machineToken: String
+    public let phase: DeactivationAttemptPhase
+    public let requestID: String?
+
+    public init(activationID: String, machineToken: String, phase: DeactivationAttemptPhase, requestID: String? = nil) {
+        self.activationID = activationID
+        self.machineToken = machineToken
+        self.phase = phase
+        self.requestID = requestID
+    }
+}
+
 public struct StoredEntitlementSnapshot: Codable, Equatable, Sendable {
     public let subject: StoredCredentialSubject
     public let snapshot: EntitlementSnapshot
     public let validatedBuild: ValidationBuildIdentity?
+    public let credentialBinding: String?
+    public let confirmedRemoteDeactivation: Bool?
 
-    public init(subject: StoredCredentialSubject, snapshot: EntitlementSnapshot, validatedBuild: ValidationBuildIdentity? = nil) {
+    public init(subject: StoredCredentialSubject, snapshot: EntitlementSnapshot, validatedBuild: ValidationBuildIdentity? = nil, credentialBinding: String? = nil, confirmedRemoteDeactivation: Bool? = nil) {
         self.subject = subject
         self.snapshot = snapshot
         self.validatedBuild = validatedBuild
+        self.credentialBinding = credentialBinding
+        self.confirmedRemoteDeactivation = confirmedRemoteDeactivation
     }
 }
 
 public protocol CredentialStore: Sendable {
+    func loadDeactivationAttempt(for fingerprint: String) throws -> StoredDeactivationAttempt?
+    func saveDeactivationAttempt(_ attempt: StoredDeactivationAttempt, for fingerprint: String) throws
+    func clearDeactivationAttempt(for fingerprint: String) throws
     func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt?
     func saveValidationAttempt(_ attempt: StoredValidationAttempt, for fingerprint: String) throws
     func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification?

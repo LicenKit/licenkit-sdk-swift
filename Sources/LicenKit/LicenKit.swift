@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 public final class LicenKit: @unchecked Sendable {
     public static let minimumValidationRequestInterval: TimeInterval = 30
@@ -92,8 +93,13 @@ public final class LicenKit: @unchecked Sendable {
         }
     }
 
+    /// Restores local evidence without starting a network request. Call before validation at launch.
+    public func restoreLocalEntitlement() async -> LocalEntitlementResult {
+        await operationCoordinator.perform { [self] in await performLocalRestoration() }
+    }
+
     @discardableResult
-    public func deactivate() async -> LicenKitResult<DeactivationData> {
+    public func deactivate() async -> DeactivationResult {
         await operationCoordinator.perform { [self] in await performDeactivation() }
     }
 
@@ -103,6 +109,148 @@ public final class LicenKit: @unchecked Sendable {
 
     public func getMachineFingerprint() async throws -> String {
         try await fingerprintProvider.getFingerprint()
+    }
+
+    private func performLocalRestoration() async -> LocalEntitlementResult {
+        clearCurrentSnapshot()
+        do {
+            _ = try configuration.requireBuildIdentity()
+            let fingerprint = try await fingerprintProvider.getFingerprint()
+            if let pending = try credentialStore.loadDeactivationAttempt(for: fingerprint),
+               pending.phase == .confirmed {
+                return .verificationRequired(reason: .deactivationPending(phase: pending.phase))
+            }
+            let license = try credentialStore.loadCredentials(for: fingerprint)
+            let trial = try credentialStore.loadTrialCredentials(for: fingerprint)
+            let subject: StoredCredentialSubject = license != nil ? .license : (trial != nil ? .trial : .none)
+            guard let stored = try credentialStore.loadSnapshot(for: fingerprint) else {
+                return .verificationRequired(reason: subject == .none ? .noCredential : .noMatchingSnapshot)
+            }
+            guard stored.subject == subject else {
+                return .verificationRequired(reason: subject == .none ? .noCredential : .noMatchingSnapshot)
+            }
+            guard matchesLocalCredentials(stored, subject: subject, fingerprint: fingerprint, license: license, trial: trial) else {
+                return .verificationRequired(reason: subject == .none ? .noCredential : .noMatchingSnapshot)
+            }
+            do {
+                if subject == .none {
+                    switch stored.snapshot.state {
+                    case .activationRequired, .license(.activationDeactivated):
+                        break
+                    default:
+                        throw LicenKitError.protocolError(reason: "local snapshot state does not match absent credentials")
+                    }
+                } else {
+                    try require(stored.snapshot.state, isValidFor: subject)
+                }
+                let snapshot: EntitlementSnapshot
+                if let license, license.credentialMode == .signed {
+                    try validateSignedStateConsistency(
+                        credentials: license,
+                        fingerprint: fingerprint,
+                        snapshot: stored.snapshot
+                    )
+                    snapshot = stored.snapshot.withSignedCredentialValidity(true, source: .signedLocal)
+                } else {
+                    snapshot = stored.snapshot.source == .local
+                        ? stored.snapshot : stored.snapshot.withSource(.cache)
+                }
+                setCurrentSnapshot(snapshot)
+                if snapshot.isUsable(at: now()) { return .usable(snapshot: snapshot) }
+                switch snapshot.state {
+                case .trial(.active), .license(.active):
+                    return .verificationRequired(reason: .expired)
+                default:
+                    return .confirmedBlocked(snapshot: snapshot)
+                }
+            } catch {
+                let error = normalize(error, operation: "restore local entitlement")
+                switch error {
+                case .invalidSignedLicenseToken, .missingSigningPublicKey, .configurationError:
+                    return .verificationRequired(reason: .invalidCredential(error))
+                default:
+                    return .verificationRequired(reason: .invalidSnapshot(error))
+                }
+            }
+        } catch {
+            let error = normalize(error, operation: "restore local entitlement")
+            switch error {
+            case .credentialStorageError:
+                return .verificationRequired(reason: .storageFailure(error))
+            default:
+                return .verificationRequired(reason: .invalidCredential(error))
+            }
+        }
+    }
+
+    static func credentialBinding(
+        productID: String,
+        fingerprint: String,
+        license: StoredCredentials?,
+        trial: StoredTrialCredentials?
+    ) -> String? {
+        let fields: [String]
+        if let license {
+            fields = [productID, fingerprint, "license", license.activationID, license.machineToken]
+        } else if let trial {
+            fields = [productID, fingerprint, "trial", trial.trialID, trial.trialToken]
+        } else {
+            return nil
+        }
+        let data = Data(fields.map { "\($0.utf8.count):\($0)" }.joined().utf8)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func matchesLocalCredentials(
+        _ stored: StoredEntitlementSnapshot,
+        subject: StoredCredentialSubject,
+        fingerprint: String,
+        license: StoredCredentials?,
+        trial: StoredTrialCredentials?
+    ) -> Bool {
+        guard stored.subject == subject else { return false }
+        if subject == .none { return isConfirmedNoCredentialBlock(stored) }
+        guard stored.snapshot.source == .server else { return false }
+        guard let binding = Self.credentialBinding(
+            productID: configuration.productID,
+            fingerprint: fingerprint,
+            license: license,
+            trial: trial
+        ) else { return false }
+        return stored.credentialBinding == binding
+    }
+
+    private func isConfirmedNoCredentialBlock(_ stored: StoredEntitlementSnapshot) -> Bool {
+        guard stored.subject == .none, stored.credentialBinding == nil else { return false }
+        switch stored.snapshot.state {
+        case .activationRequired:
+            return stored.snapshot.source == .server
+                || (stored.snapshot.source == .local && stored.confirmedRemoteDeactivation == true)
+        case .license(.activationDeactivated):
+            return stored.snapshot.source == .server
+        default:
+            return false
+        }
+    }
+
+    private func isLocalNoCredentialReceipt(
+        _ stored: StoredEntitlementSnapshot,
+        subject: StoredCredentialSubject
+    ) -> Bool {
+        guard subject == .none, stored.subject == .none,
+              stored.snapshot.source == .local, stored.credentialBinding == nil else { return false }
+        if case .unknown = stored.snapshot.state { return true }
+        return false
+    }
+
+    private func requireNoPendingDeactivation(
+        for fingerprint: String,
+        allowUnconfirmedRequest: Bool = false
+    ) throws {
+        if let attempt = try credentialStore.loadDeactivationAttempt(for: fingerprint) {
+            if allowUnconfirmedRequest && attempt.phase == .requested { return }
+            throw LicenKitError.deactivationRecoveryRequired(phase: attempt.phase)
+        }
     }
 
     private func performActivation(
@@ -118,9 +266,7 @@ public final class LicenKit: @unchecked Sendable {
             }
             let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
-            if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
-                setCurrentSnapshot(stored.snapshot)
-            }
+            try requireNoPendingDeactivation(for: fingerprint)
             let requestedMachineName = machineName ?? ProcessInfo.processInfo.hostName
             let verification: StoredActivationVerification
             if let existing = try credentialStore.loadActivationVerification(for: fingerprint) {
@@ -204,9 +350,9 @@ public final class LicenKit: @unchecked Sendable {
         do {
             let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
+            try requireNoPendingDeactivation(for: fingerprint)
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 lastKnown = stored.snapshot
-                setCurrentSnapshot(stored.snapshot)
             }
             let verification: StoredTrialVerification
             if let existing = try credentialStore.loadTrialVerification(for: fingerprint) {
@@ -281,6 +427,7 @@ public final class LicenKit: @unchecked Sendable {
             let buildIdentity = ValidationBuildIdentity(version: build.version, platform: build.platform, arch: build.arch)
             let fingerprint = try await fingerprintProvider.getFingerprint()
             validationFingerprint = fingerprint
+            try requireNoPendingDeactivation(for: fingerprint, allowUnconfirmedRequest: true)
             let license = try credentialStore.loadCredentials(for: fingerprint)
             let trial = try credentialStore.loadTrialCredentials(for: fingerprint)
             let subject: StoredCredentialSubject
@@ -301,13 +448,19 @@ public final class LicenKit: @unchecked Sendable {
             validationSubject = subject
 
             let stored = try credentialStore.loadSnapshot(for: fingerprint)
-            validationStoredSnapshot = stored
-            if let stored {
-                lastKnown = stored.snapshot
-                setCurrentSnapshot(stored.snapshot)
-            }
             let attempt = try credentialStore.loadValidationAttempt(for: fingerprint)
-            let matchingStored = stored?.subject == subject ? stored : nil
+            let matchingStored = stored.flatMap {
+                (matchesLocalCredentials($0, subject: subject, fingerprint: fingerprint, license: license, trial: trial)
+                    || isLocalNoCredentialReceipt($0, subject: subject))
+                    ? $0 : nil
+            }
+            validationStoredSnapshot = matchingStored
+            if let matchingStored {
+                lastKnown = matchingStored.snapshot
+            } else {
+                clearCurrentSnapshot()
+                lastKnown = nil
+            }
             let decision = validationCooldownDecision(
                 snapshot: matchingStored?.snapshot,
                 validatedBuild: matchingStored?.validatedBuild,
@@ -471,17 +624,38 @@ public final class LicenKit: @unchecked Sendable {
         }
     }
 
-    private func performDeactivation() async -> LicenKitResult<DeactivationData> {
+    private func performDeactivation() async -> DeactivationResult {
         var lastKnown = currentSnapshot
         var requestStarted = false
         var responseRequestID: String?
+        var remoteConfirmed = false
+        var repairStage: DeactivationRepairStage = .recordConfirmation
+        var fingerprintForRecovery: String?
         do {
             let fingerprint = try await fingerprintProvider.getFingerprint()
+            fingerprintForRecovery = fingerprint
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 lastKnown = stored.snapshot
-                setCurrentSnapshot(stored.snapshot)
             }
-            guard let credentials = try credentialStore.loadCredentials(for: fingerprint) else {
+            var attempt = try credentialStore.loadDeactivationAttempt(for: fingerprint)
+            if attempt == nil, let credentials = try credentialStore.loadCredentials(for: fingerprint) {
+                let newAttempt = StoredDeactivationAttempt(
+                    activationID: credentials.activationID,
+                    machineToken: credentials.machineToken,
+                    phase: .requested
+                )
+                try credentialStore.saveDeactivationAttempt(newAttempt, for: fingerprint)
+                attempt = newAttempt
+            }
+            guard var attempt else {
+                if let stored = try credentialStore.loadSnapshot(for: fingerprint),
+                   isConfirmedNoCredentialBlock(stored) {
+                    setCurrentSnapshot(stored.snapshot)
+                    return .success(
+                        value: DeactivationData(wasDeactivated: false, snapshot: stored.snapshot),
+                        metadata: OperationMetadata(source: .local)
+                    )
+                }
                 let (snapshot, subject) = try postDeactivationState(
                     fingerprint: fingerprint,
                     stored: try credentialStore.loadSnapshot(for: fingerprint)
@@ -493,36 +667,83 @@ public final class LicenKit: @unchecked Sendable {
                 )
             }
 
-            requestStarted = true
-            let response = try await apiClient.deactivate(request: APIDeactivateRequest(
-                productID: configuration.productID,
-                activationID: credentials.activationID,
-                machineToken: credentials.machineToken,
-                fingerprint: fingerprint
-            ))
-            responseRequestID = response.meta.requestID
-            guard response.status == "deactivated", response.activationID == credentials.activationID else {
-                throw LicenKitError.protocolError(reason: "server did not confirm remote deactivation")
+            if attempt.phase == .requested {
+                requestStarted = true
+                let response = try await apiClient.deactivate(request: APIDeactivateRequest(
+                    productID: configuration.productID,
+                    activationID: attempt.activationID,
+                    machineToken: attempt.machineToken,
+                    fingerprint: fingerprint
+                ))
+                responseRequestID = response.meta.requestID
+                guard response.status == "deactivated", response.activationID == attempt.activationID else {
+                    throw LicenKitError.protocolError(reason: "server did not confirm remote deactivation")
+                }
+                remoteConfirmed = true
+                setCurrentSnapshot(localUnknownSnapshot(lastValidateResponseAt: nil))
+                attempt = StoredDeactivationAttempt(
+                    activationID: attempt.activationID,
+                    machineToken: attempt.machineToken,
+                    phase: .confirmed,
+                    requestID: responseRequestID
+                )
+                repairStage = .recordConfirmation
+                try credentialStore.saveDeactivationAttempt(attempt, for: fingerprint)
+            } else {
+                remoteConfirmed = true
+                responseRequestID = attempt.requestID
+                setCurrentSnapshot(localUnknownSnapshot(lastValidateResponseAt: nil))
             }
+
+            repairStage = .clearCredential
             try credentialStore.clearCredentials(for: fingerprint)
+            repairStage = .resolveRemainingEntitlement
             let (snapshot, subject) = try postDeactivationState(fingerprint: fingerprint, stored: nil)
-            try persist(snapshot: snapshot, subject: subject, fingerprint: fingerprint)
+            repairStage = .saveSnapshot
+            try persist(
+                snapshot: snapshot,
+                subject: subject,
+                fingerprint: fingerprint,
+                confirmedRemoteDeactivation: true
+            )
+            repairStage = .clearRecoveryRecord
+            try credentialStore.clearDeactivationAttempt(for: fingerprint)
             return .success(
                 value: DeactivationData(wasDeactivated: true, snapshot: snapshot),
-                metadata: OperationMetadata(source: .server, requestID: response.meta.requestID)
+                metadata: OperationMetadata(source: .server, requestID: responseRequestID)
             )
         } catch {
             let licenKitError = normalize(error, operation: "deactivate")
+            if remoteConfirmed {
+                return .remoteConfirmedLocalRepairRequired(
+                    stage: repairStage,
+                    error: licenKitError,
+                    metadata: OperationMetadata(source: .server, requestID: responseRequestID)
+                )
+            }
+            var remoteOutcome: DeactivationRemoteOutcome = requestStarted ? .unknown : .notRequested
+            var recoveryError: LicenKitError?
+            if requestStarted,
+               case .apiError(let statusCode, _, _, _, _) = licenKitError,
+               (400...499).contains(statusCode),
+               let fingerprintForRecovery {
+                remoteOutcome = .rejected
+                do {
+                    try credentialStore.clearDeactivationAttempt(for: fingerprintForRecovery)
+                } catch {
+                    recoveryError = normalize(error, operation: "clear rejected deactivation attempt")
+                }
+            }
             return .failure(
                 error: licenKitError,
-                lastKnownValue: lastKnown.map {
-                    DeactivationData(wasDeactivated: false, snapshot: $0)
-                },
+                remoteOutcome: remoteOutcome,
+                lastKnownSnapshot: lastKnown,
                 metadata: failureMetadata(
                     error: licenKitError,
                     requestStarted: requestStarted,
                     responseRequestID: responseRequestID
-                )
+                ),
+                localRecoveryError: recoveryError
             )
         }
     }
@@ -623,7 +844,8 @@ public final class LicenKit: @unchecked Sendable {
         guard credentials.credentialMode == .signed else { return }
         let evaluation = try signedEvaluation(credentials, fingerprint: fingerprint)
         switch (snapshot.state, evaluation) {
-        case (.license(.active(let terms, let expiresAt)), .active(let claims)):
+        case (.license(.active(let terms, let expiresAt)), .active(let claims)),
+             (.license(.active(let terms, let expiresAt)), .licenseExpired(let claims)):
             guard terms.features == claims.features,
                   datesEqual(terms.updatesUntil?.date, claims.updatesUntil),
                   datesEqual(expiresAt, claims.licenseExpiresAt) else {
@@ -631,14 +853,12 @@ public final class LicenKit: @unchecked Sendable {
                     reason: "License active state does not match signed claims"
                 )
             }
-        case (.license(.expired(let expiresAt)), .licenseExpired(let signedExpiresAt)):
-            guard datesEqual(expiresAt, signedExpiresAt) else {
-                throw LicenKitError.protocolError(reason: "License expiry state does not match signed claims")
-            }
-        case (.license(.suspended), .active),
-             (.license(.revoked), .active),
-             (.license(.activationRevoked), .active),
-             (.license(.activationDeactivated), .active):
+        case (.license(.expired), _),
+             (.license(.suspended), _),
+             (.license(.revoked), _),
+             (.license(.activationRevoked), _),
+             (.license(.activationDeactivated), _),
+             (.licenseNotValidForVersion, _):
             break
         default:
             throw LicenKitError.protocolError(
@@ -663,26 +883,32 @@ public final class LicenKit: @unchecked Sendable {
         build: ValidationBuildIdentity,
         trigger: ValidationTrigger
     ) -> ValidationCooldownDecision {
-        var cached = snapshot?.withSource(.cache)
+        var cached = snapshot.map { $0.source == .local ? $0 : $0.withSource(.cache) }
         var isSignedCredentialValid: Bool?
         var bypassConfiguredInterval = false
         var localError: LicenKitError?
 
-        if let snapshot, let licenseCredentials, licenseCredentials.credentialMode == .signed {
+        if let licenseCredentials, licenseCredentials.credentialMode == .signed {
             do {
-                try validateSignedStateConsistency(
-                    credentials: licenseCredentials,
-                    fingerprint: fingerprint,
-                    snapshot: snapshot
-                )
+                if let snapshot {
+                    try validateSignedStateConsistency(
+                        credentials: licenseCredentials,
+                        fingerprint: fingerprint,
+                        snapshot: snapshot
+                    )
+                } else {
+                    _ = try signedEvaluation(licenseCredentials, fingerprint: fingerprint)
+                }
                 isSignedCredentialValid = true
-                let source: StateSource
-                if case .license(.active) = snapshot.state { source = .signedLocal }
-                else { source = .cache }
-                cached = snapshot.withSignedCredentialValidity(true, source: source)
+                if let snapshot {
+                    let source: StateSource
+                    if case .license(.active) = snapshot.state { source = .signedLocal }
+                    else { source = .cache }
+                    cached = snapshot.withSignedCredentialValidity(true, source: source)
+                }
             } catch {
                 isSignedCredentialValid = false
-                cached = snapshot.withSignedCredentialValidity(false, source: .local)
+                cached = snapshot?.withSignedCredentialValidity(false, source: .local)
                 if case LicenKitError.invalidSignedLicenseToken = error {
                     bypassConfiguredInterval = true
                 } else {
@@ -968,10 +1194,26 @@ public final class LicenKit: @unchecked Sendable {
         snapshot: EntitlementSnapshot,
         subject: StoredCredentialSubject,
         fingerprint: String,
-        validatedBuild: ValidationBuildIdentity? = nil
+        validatedBuild: ValidationBuildIdentity? = nil,
+        confirmedRemoteDeactivation: Bool = false
     ) throws {
+        let binding = Self.credentialBinding(
+            productID: configuration.productID,
+            fingerprint: fingerprint,
+            license: subject == .license ? try credentialStore.loadCredentials(for: fingerprint) : nil,
+            trial: subject == .trial ? try credentialStore.loadTrialCredentials(for: fingerprint) : nil
+        )
+        if subject != .none, binding == nil {
+            throw LicenKitError.protocolError(reason: "cannot persist entitlement without matching credentials")
+        }
         try credentialStore.saveSnapshot(
-            StoredEntitlementSnapshot(subject: subject, snapshot: snapshot, validatedBuild: validatedBuild),
+            StoredEntitlementSnapshot(
+                subject: subject,
+                snapshot: snapshot,
+                validatedBuild: validatedBuild,
+                credentialBinding: binding,
+                confirmedRemoteDeactivation: confirmedRemoteDeactivation ? true : nil
+            ),
             for: fingerprint
         )
         setCurrentSnapshot(snapshot)
@@ -1095,6 +1337,12 @@ public final class LicenKit: @unchecked Sendable {
     private func setCurrentSnapshot(_ snapshot: EntitlementSnapshot) {
         stateLock.lock()
         storedSnapshot = snapshot
+        stateLock.unlock()
+    }
+
+    private func clearCurrentSnapshot() {
+        stateLock.lock()
+        storedSnapshot = nil
         stateLock.unlock()
     }
 

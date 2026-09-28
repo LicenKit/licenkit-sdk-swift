@@ -25,6 +25,54 @@ public enum ValidationTrigger: Equatable, Sendable {
     case userInitiated
 }
 
+/// A local assessment is complete before any network validation begins.
+/// Only `usable` permits an offline access decision.
+public enum LocalEntitlementResult: Equatable, Sendable {
+    case usable(snapshot: EntitlementSnapshot)
+    case confirmedBlocked(snapshot: EntitlementSnapshot)
+    case verificationRequired(reason: LocalEvidenceIssue)
+}
+
+public enum LocalEvidenceIssue: Equatable, Sendable {
+    case noCredential
+    case noMatchingSnapshot
+    case expired
+    case invalidCredential(LicenKitError)
+    case storageFailure(LicenKitError)
+    case invalidSnapshot(LicenKitError)
+    case deactivationPending(phase: DeactivationAttemptPhase)
+}
+
+public enum DeactivationRemoteOutcome: Equatable, Sendable {
+    case notRequested
+    case rejected
+    case unknown
+}
+
+public enum DeactivationRepairStage: Equatable, Sendable {
+    case recordConfirmation
+    case clearCredential
+    case resolveRemainingEntitlement
+    case saveSnapshot
+    case clearRecoveryRecord
+}
+
+public enum DeactivationResult: Equatable, Sendable {
+    case success(value: DeactivationData, metadata: OperationMetadata)
+    case remoteConfirmedLocalRepairRequired(
+        stage: DeactivationRepairStage,
+        error: LicenKitError,
+        metadata: OperationMetadata
+    )
+    case failure(
+        error: LicenKitError,
+        remoteOutcome: DeactivationRemoteOutcome,
+        lastKnownSnapshot: EntitlementSnapshot?,
+        metadata: OperationMetadata,
+        localRecoveryError: LicenKitError?
+    )
+}
+
 public struct OperationMetadata: Equatable, Sendable {
     public let source: StateSource
     public let requestID: String?

@@ -10,8 +10,36 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
     private var trials: [String: StoredTrialCredentials] = [:]
     private var snapshots: [String: StoredEntitlementSnapshot] = [:]
     private var validationAttempts: [String: StoredValidationAttempt] = [:]
+    private var deactivationAttempts: [String: StoredDeactivationAttempt] = [:]
     private var shouldFailNextLicenseSave = false
     private var shouldFailNextTrialSave = false
+    private var shouldFailNextSnapshotSave = false
+    private var shouldFailNextLicenseClear = false
+    private var shouldFailNextDeactivationAttemptSave = false
+    private var shouldFailNextConfirmedDeactivationAttemptSave = false
+
+    func loadDeactivationAttempt(for fingerprint: String) throws -> StoredDeactivationAttempt? {
+        lock.withLock { deactivationAttempts[fingerprint] }
+    }
+
+    func saveDeactivationAttempt(_ attempt: StoredDeactivationAttempt, for fingerprint: String) throws {
+        let shouldFail = lock.withLock {
+            defer { shouldFailNextDeactivationAttemptSave = false }
+            if attempt.phase == .confirmed, shouldFailNextConfirmedDeactivationAttemptSave {
+                shouldFailNextConfirmedDeactivationAttemptSave = false
+                return true
+            }
+            return shouldFailNextDeactivationAttemptSave
+        }
+        if shouldFail {
+            throw LicenKitError.credentialStorageError(operation: "write", status: -1)
+        }
+        lock.withLock { deactivationAttempts[fingerprint] = attempt }
+    }
+
+    func clearDeactivationAttempt(for fingerprint: String) throws {
+        _ = lock.withLock { deactivationAttempts.removeValue(forKey: fingerprint) }
+    }
 
     func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt? {
         lock.withLock { validationAttempts[fingerprint] }
@@ -26,6 +54,22 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
 
     func failNextTrialSave() {
         lock.withLock { shouldFailNextTrialSave = true }
+    }
+
+    func failNextSnapshotSave() {
+        lock.withLock { shouldFailNextSnapshotSave = true }
+    }
+
+    func failNextLicenseClear() {
+        lock.withLock { shouldFailNextLicenseClear = true }
+    }
+
+    func failNextDeactivationAttemptSave() {
+        lock.withLock { shouldFailNextDeactivationAttemptSave = true }
+    }
+
+    func failNextConfirmedDeactivationAttemptSave() {
+        lock.withLock { shouldFailNextConfirmedDeactivationAttemptSave = true }
     }
 
     func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification? {
@@ -52,6 +96,13 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
         lock.withLock { licenses[fingerprint] = credentials }
     }
     func clearCredentials(for fingerprint: String) throws {
+        let shouldFail = lock.withLock {
+            defer { shouldFailNextLicenseClear = false }
+            return shouldFailNextLicenseClear
+        }
+        if shouldFail {
+            throw LicenKitError.credentialStorageError(operation: "delete", status: -1)
+        }
         _ = lock.withLock { licenses.removeValue(forKey: fingerprint) }
     }
     func loadTrialCredentials(for fingerprint: String) throws -> StoredTrialCredentials? {
@@ -83,6 +134,31 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
         lock.withLock { snapshots[fingerprint] }
     }
     func saveSnapshot(_ snapshot: StoredEntitlementSnapshot, for fingerprint: String) throws {
+        let shouldFail = lock.withLock {
+            defer { shouldFailNextSnapshotSave = false }
+            return shouldFailNextSnapshotSave
+        }
+        if shouldFail {
+            throw LicenKitError.credentialStorageError(operation: "write", status: -1)
+        }
+        lock.withLock {
+            let binding = LicenKit.credentialBinding(
+                productID: "prd_1",
+                fingerprint: fingerprint,
+                license: snapshot.subject == .license ? licenses[fingerprint] : nil,
+                trial: snapshot.subject == .trial ? trials[fingerprint] : nil
+            )
+            snapshots[fingerprint] = StoredEntitlementSnapshot(
+                subject: snapshot.subject,
+                snapshot: snapshot.snapshot,
+                validatedBuild: snapshot.validatedBuild,
+                credentialBinding: snapshot.credentialBinding ?? binding,
+                confirmedRemoteDeactivation: snapshot.confirmedRemoteDeactivation
+            )
+        }
+    }
+
+    func saveUnboundSnapshot(_ snapshot: StoredEntitlementSnapshot, for fingerprint: String) {
         lock.withLock { snapshots[fingerprint] = snapshot }
     }
 }
@@ -142,6 +218,101 @@ final class V1ContractTests: XCTestCase {
         session.invalidateAndCancel()
         session = nil
         super.tearDown()
+    }
+
+    func testLocalRestorationSeparatesOfflineAccessFromNetworkValidation() async throws {
+        let emptyStore = MemoryCredentialStore()
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.notConnectedToInternet)
+        }
+        let newDevice = makeClient(store: emptyStore)
+        let newDeviceResult = await newDevice.restoreLocalEntitlement()
+        XCTAssertEqual(newDeviceResult, .verificationRequired(reason: .noCredential))
+
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        let existingDevice = makeClient(store: store)
+        guard case .usable(let local) = await existingDevice.restoreLocalEntitlement() else {
+            return XCTFail("A bound active License must be usable before networking")
+        }
+        XCTAssertEqual(local.source, .cache)
+        XCTAssertEqual(requests.get(), 0)
+        guard case .failure(.transportError(.network, _), _, _) = await existingDevice.validate(trigger: .silent) else {
+            return XCTFail("The later offline validation must retain its real transport error")
+        }
+        XCTAssertEqual(requests.get(), 1)
+        XCTAssertTrue(existingDevice.currentSnapshot?.isUsable(at: validatedAt.addingTimeInterval(10)) ?? false)
+    }
+
+    func testLocalRestorationRejectsMissingOrMismatchedEvidenceAndRestoresBlockedState() async throws {
+        let missingCredentials = MemoryCredentialStore()
+        missingCredentials.saveUnboundSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        let missingResult = await makeClient(store: missingCredentials).restoreLocalEntitlement()
+        XCTAssertEqual(missingResult, .verificationRequired(reason: .noCredential))
+
+        let mismatched = MemoryCredentialStore()
+        try mismatched.saveCredentials(opaqueCredentials(), for: fingerprint)
+        mismatched.saveUnboundSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        let mismatchedResult = await makeClient(store: mismatched).restoreLocalEntitlement()
+        XCTAssertEqual(mismatchedResult, .verificationRequired(reason: .noMatchingSnapshot))
+
+        let blocked = MemoryCredentialStore()
+        let snapshot = EntitlementSnapshot(
+            state: .activationRequired(trial: .unknown), source: .server,
+            validatedAt: validatedAt, receivedValidationInterval: 3_600,
+            effectiveValidationInterval: 3_600
+        )
+        try blocked.saveSnapshot(.init(subject: .none, snapshot: snapshot), for: fingerprint)
+        guard case .confirmedBlocked(let restored) = await makeClient(store: blocked).restoreLocalEntitlement() else {
+            return XCTFail("A Server-confirmed blocked cache must restore as blocked")
+        }
+        XCTAssertEqual(restored.source, .cache)
+
+        let deactivated = MemoryCredentialStore()
+        let deactivatedSnapshot = EntitlementSnapshot(
+            state: .license(.activationDeactivated), source: .server,
+            validatedAt: validatedAt, receivedValidationInterval: 3_600,
+            effectiveValidationInterval: 3_600
+        )
+        try deactivated.saveSnapshot(
+            .init(subject: .none, snapshot: deactivatedSnapshot), for: fingerprint
+        )
+        guard case .confirmedBlocked = await makeClient(store: deactivated).restoreLocalEntitlement() else {
+            return XCTFail("A Server-confirmed deactivation remains a blocked business state")
+        }
+    }
+
+    func testLocalTrialRestorationRespectsBusinessExpiry() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveTrialCredentials(.init(trialID: "trl_1", trialToken: "ttk_secret"), for: fingerprint)
+        let expiry = validatedAt.addingTimeInterval(100)
+        let snapshot = EntitlementSnapshot(
+            state: .trial(.active(expiresAt: expiry, features: ["export"])),
+            source: .server, validatedAt: validatedAt,
+            receivedValidationInterval: 3_600, effectiveValidationInterval: 3_600
+        )
+        try store.saveSnapshot(.init(subject: .trial, snapshot: snapshot), for: fingerprint)
+        guard case .usable = await makeClient(
+            store: store, clock: MutableClock(expiry.addingTimeInterval(-1))
+        ).restoreLocalEntitlement() else {
+            return XCTFail("A bound active Trial must restore without networking")
+        }
+        let expired = await makeClient(
+            store: store, clock: MutableClock(expiry)
+        ).restoreLocalEntitlement()
+        XCTAssertEqual(expired, .verificationRequired(reason: .expired))
     }
 
     func testNoCredentialTrialAvailabilityMapsWithoutLeakingClaimData() async throws {
@@ -1102,6 +1273,115 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(requests.get(), 0)
     }
 
+    func testExpiredSignedActiveCacheCanReachServerForBothValidationTriggers() async throws {
+        for trigger in [ValidationTrigger.silent, .userInitiated] {
+            let key = Curve25519.Signing.PrivateKey()
+            let expiry = validatedAt.addingTimeInterval(100)
+            let token = try makeToken(privateKey: key, licenseExpiresAt: expiry)
+            let store = MemoryCredentialStore()
+            try store.saveCredentials(signedCredentials(token: token), for: fingerprint)
+            let active = EntitlementSnapshot(
+                state: .license(.active(
+                    terms: LicenseTerms(maxActivations: 1, features: ["export"], updatesUntil: nil),
+                    expiresAt: expiry
+                )),
+                source: .server, validatedAt: validatedAt,
+                receivedValidationInterval: 3_600, effectiveValidationInterval: 3_600,
+                lastValidateResponseAt: validatedAt, signedCredentialValid: true
+            )
+            try store.saveSnapshot(.init(subject: .license, snapshot: active, validatedBuild: currentBuild), for: fingerprint)
+            let clock = MutableClock(expiry.addingTimeInterval(1))
+            let requests = LockedBox(0)
+            setHandler { _ in
+                requests.mutate { $0 += 1 }
+                return self.response(data: self.validateData(state: [
+                    "kind": "license", "status": "expired", "code": "LICENSE_EXPIRED",
+                    "expires_at": self.iso(expiry)
+                ]))
+            }
+            let client = makeClient(
+                store: store, clock: clock,
+                signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
+            )
+            let localResult = await client.restoreLocalEntitlement()
+            XCTAssertEqual(localResult, .verificationRequired(reason: .expired))
+            guard case .success(let confirmed, _) = await client.validate(trigger: trigger),
+                  case .license(.expired(let returnedExpiry)) = confirmed.state else {
+                return XCTFail("An elapsed signed cache must reach the Server")
+            }
+            XCTAssertEqual(returnedExpiry, expiry)
+            XCTAssertEqual(requests.get(), 1)
+        }
+    }
+
+    func testExpiredSignedCacheStillRejectsRealClaimMismatchBeforeRequest() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let expiry = validatedAt.addingTimeInterval(100)
+        let token = try makeToken(privateKey: key, features: ["other"], licenseExpiresAt: expiry)
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(signedCredentials(token: token), for: fingerprint)
+        let active = EntitlementSnapshot(
+            state: .license(.active(
+                terms: LicenseTerms(maxActivations: 1, features: ["export"], updatesUntil: nil),
+                expiresAt: expiry
+            )),
+            source: .server, validatedAt: validatedAt,
+            receivedValidationInterval: 3_600, effectiveValidationInterval: 3_600,
+            lastValidateResponseAt: validatedAt, signedCredentialValid: true
+        )
+        try store.saveSnapshot(.init(subject: .license, snapshot: active, validatedBuild: currentBuild), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.notConnectedToInternet)
+        }
+        let result = await makeClient(
+            store: store,
+            clock: MutableClock(expiry.addingTimeInterval(1)),
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
+        ).validate(trigger: .silent)
+        guard case .failure(.protocolError(let reason), _, _) = result else {
+            return XCTFail("A true claims mismatch must retain its protocol error")
+        }
+        XCTAssertTrue(reason.contains("signed claims"))
+        XCTAssertEqual(requests.get(), 0)
+    }
+
+    func testLocalSignedRestorationRejectsInvalidSignatureButRestoresServerBlockedState() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let otherKey = Curve25519.Signing.PrivateKey()
+        let token = try makeToken(privateKey: key)
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(signedCredentials(token: token), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(
+                validatedAt: validatedAt, interval: 3_600, signedCredentialValid: true
+            )),
+            for: fingerprint
+        )
+        let invalid = await makeClient(
+            store: store,
+            signingPublicKey: otherKey.publicKey.rawRepresentation.base64EncodedString()
+        ).restoreLocalEntitlement()
+        guard case .verificationRequired(.invalidCredential(.invalidSignedLicenseToken)) = invalid else {
+            return XCTFail("An invalid signature cannot authorize local access")
+        }
+
+        let blocked = EntitlementSnapshot(
+            state: .license(.suspended(reason: "payment")), source: .server,
+            validatedAt: validatedAt, receivedValidationInterval: 3_600,
+            effectiveValidationInterval: 3_600, signedCredentialValid: true
+        )
+        try store.saveSnapshot(.init(subject: .license, snapshot: blocked), for: fingerprint)
+        guard case .confirmedBlocked(let restored) = await makeClient(
+            store: store,
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
+        ).restoreLocalEntitlement() else {
+            return XCTFail("A valid signed credential must not hide a confirmed Server block")
+        }
+        XCTAssertEqual(restored.state, blocked.state)
+    }
+
     func testInvalidSignedCredentialBypassesConfiguredIntervalButNotThirtySeconds() async throws {
         let signingKey = Curve25519.Signing.PrivateKey()
         let unrelatedKey = Curve25519.Signing.PrivateKey()
@@ -1512,6 +1792,210 @@ final class V1ContractTests: XCTestCase {
             try store.loadSnapshot(for: fingerprint)?.subject,
             StoredCredentialSubject.none
         )
+        guard case .confirmedBlocked(let restored) = await makeClient(store: store).restoreLocalEntitlement() else {
+            return XCTFail("A confirmed remote deactivation must restore as blocked after restart")
+        }
+        XCTAssertEqual(restored.source, .local)
+        guard case .success(let repeated, _) = await client.deactivate() else {
+            return XCTFail("A repeated local no-op must preserve the confirmed deactivation record")
+        }
+        XCTAssertFalse(repeated.wasDeactivated)
+        guard case .confirmedBlocked = await makeClient(store: store).restoreLocalEntitlement() else {
+            return XCTFail("A repeated no-op must not erase the prior remote confirmation")
+        }
+    }
+
+    func testDeactivationReportsRemoteConfirmationAndRecoversAfterLocalFailures() async throws {
+        for failingStage in [DeactivationRepairStage.clearCredential, .saveSnapshot] {
+            let store = MemoryCredentialStore()
+            try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+            try store.saveSnapshot(
+                .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+                for: fingerprint
+            )
+            switch failingStage {
+            case .clearCredential: store.failNextLicenseClear()
+            case .saveSnapshot: store.failNextSnapshotSave()
+            default: return XCTFail("Unexpected test stage")
+            }
+            let requests = LockedBox(0)
+            setHandler { _ in
+                requests.mutate { $0 += 1 }
+                return self.response(data: [
+                    "activation_id": "act_1", "status": "deactivated",
+                    "meta": ["request_id": "req_deactivate"]
+                ])
+            }
+            let client = makeClient(store: store)
+            guard case .remoteConfirmedLocalRepairRequired(
+                let stage, .credentialStorageError, let metadata
+            ) = await client.deactivate() else {
+                return XCTFail("Remote confirmation and local failure must both be explicit")
+            }
+            XCTAssertEqual(stage, failingStage)
+            XCTAssertEqual(metadata.requestID, "req_deactivate")
+            XCTAssertEqual(requests.get(), 1)
+            XCTAssertEqual(try store.loadDeactivationAttempt(for: fingerprint)?.phase, .confirmed)
+            XCTAssertFalse(client.currentSnapshot?.isUsable(at: validatedAt) ?? true)
+
+            let restarted = makeClient(store: store)
+            let local = await restarted.restoreLocalEntitlement()
+            XCTAssertEqual(local, .verificationRequired(reason: .deactivationPending(phase: .confirmed)))
+            guard case .success(let completed, let recoveredMetadata) = await restarted.deactivate() else {
+                return XCTFail("Retry must finish local cleanup without repeating confirmed remote work")
+            }
+            XCTAssertTrue(completed.wasDeactivated)
+            XCTAssertEqual(recoveredMetadata.requestID, "req_deactivate")
+            XCTAssertEqual(requests.get(), 1)
+            XCTAssertNil(try store.loadCredentials(for: fingerprint))
+            XCTAssertNil(try store.loadDeactivationAttempt(for: fingerprint))
+        }
+    }
+
+    func testDeactivationRetriesWhenRecordingRemoteConfirmationFails() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        store.failNextConfirmedDeactivationAttemptSave()
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            return self.response(data: [
+                "activation_id": "act_1", "status": "deactivated",
+                "meta": ["request_id": "req_deactivate"]
+            ])
+        }
+        let first = makeClient(store: store)
+        guard case .remoteConfirmedLocalRepairRequired(
+            .recordConfirmation, .credentialStorageError, let metadata
+        ) = await first.deactivate() else {
+            return XCTFail("Remote confirmation and failed local recording must both remain visible")
+        }
+        XCTAssertEqual(metadata.requestID, "req_deactivate")
+        XCTAssertFalse(first.currentSnapshot?.isUsable(at: validatedAt) ?? true)
+        XCTAssertEqual(try store.loadDeactivationAttempt(for: fingerprint)?.phase, .requested)
+
+        let restarted = makeClient(store: store)
+        guard case .success(let completed, _) = await restarted.deactivate() else {
+            return XCTFail("Retry must reconfirm the server outcome using the original token")
+        }
+        XCTAssertTrue(completed.wasDeactivated)
+        XCTAssertEqual(requests.get(), 2)
+        XCTAssertNil(try store.loadDeactivationAttempt(for: fingerprint))
+        XCTAssertNil(try store.loadCredentials(for: fingerprint))
+    }
+
+    func testDeactivationUnknownRemoteOutcomeRetainsRecoveryRecordAcrossRestart() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        setHandler { _ in throw URLError(.networkConnectionLost) }
+        let first = makeClient(store: store)
+        guard case .failure(.transportError, .unknown, _, _, nil) = await first.deactivate() else {
+            return XCTFail("A lost response must not be reported as remote rejection")
+        }
+        XCTAssertEqual(try store.loadDeactivationAttempt(for: fingerprint)?.phase, .requested)
+        let restarted = makeClient(store: store)
+        let local = await restarted.restoreLocalEntitlement()
+        guard case .usable(let snapshot) = local else {
+            return XCTFail("An unconfirmed remote request must retain existing credible access")
+        }
+        XCTAssertTrue(snapshot.isUsable(at: validatedAt))
+        XCTAssertEqual(try store.loadDeactivationAttempt(for: fingerprint)?.phase, .requested)
+
+        try store.clearCredentials(for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { request in
+            requests.mutate { $0 += 1 }
+            let body = try self.requestJSON(request)
+            XCTAssertEqual(body["machine_token"] as? String, "mtk_secret")
+            return self.response(data: [
+                "activation_id": "act_1", "status": "deactivated",
+                "meta": ["request_id": "req_retry"]
+            ])
+        }
+        guard case .success(let completed, _) = await restarted.deactivate() else {
+            return XCTFail("Recovery record must permit an idempotent retry without the main credential")
+        }
+        XCTAssertTrue(completed.wasDeactivated)
+        XCTAssertEqual(requests.get(), 1)
+        XCTAssertNil(try store.loadDeactivationAttempt(for: fingerprint))
+    }
+
+    func testValidationCanRefreshStateWhileDeactivationOutcomeIsUnknown() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        try store.saveDeactivationAttempt(
+            .init(activationID: "act_1", machineToken: "mtk_secret", phase: .requested),
+            for: fingerprint
+        )
+        setJSONResponse(data: validateData(state: [
+            "kind": "license", "status": "activation_deactivated", "code": "ACTIVATION_DEACTIVATED"
+        ]))
+        let client = makeClient(store: store)
+        guard case .usable = await client.restoreLocalEntitlement() else {
+            return XCTFail("Pending remote confirmation must preserve the old credible local result")
+        }
+        guard case .success(let snapshot, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("Online validation must remain available while deactivation is unconfirmed")
+        }
+        XCTAssertEqual(snapshot.state, .license(.activationDeactivated))
+        XCTAssertNil(try store.loadCredentials(for: fingerprint))
+        guard case .confirmedBlocked(let restored) = await makeClient(store: store).restoreLocalEntitlement() else {
+            return XCTFail("The confirmed server result must replace the prior local access decision")
+        }
+        XCTAssertEqual(restored.state, .license(.activationDeactivated))
+        XCTAssertEqual(try store.loadDeactivationAttempt(for: fingerprint)?.phase, .requested)
+    }
+
+    func testDeactivationDoesNotRequestWhenRecoveryRecordCannotBeSaved() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        store.failNextDeactivationAttemptSave()
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.notConnectedToInternet)
+        }
+        guard case .failure(.credentialStorageError, .notRequested, _, _, nil) = await makeClient(store: store).deactivate() else {
+            return XCTFail("A failed preflight write must prevent the remote request")
+        }
+        XCTAssertEqual(requests.get(), 0)
+        XCTAssertNotNil(try store.loadCredentials(for: fingerprint))
+    }
+
+    func testDeactivationDefinitiveRejectionPreservesCredentialAndClearsRecoveryRecord() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(
+            .init(subject: .license, snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600)),
+            for: fingerprint
+        )
+        setJSONError(status: 429, code: "RATE_LIMITED", requestID: "req_rejected")
+        guard case .failure(
+            .apiError(_, let code, _, let requestID, _),
+            .rejected, _, let metadata, nil
+        ) = await makeClient(store: store).deactivate() else {
+            return XCTFail("A confirmed Server rejection must retain the original error")
+        }
+        XCTAssertEqual(code, "RATE_LIMITED")
+        XCTAssertEqual(requestID, "req_rejected")
+        XCTAssertEqual(metadata.requestID, "req_rejected")
+        XCTAssertNil(try store.loadDeactivationAttempt(for: fingerprint))
+        XCTAssertNotNil(try store.loadCredentials(for: fingerprint))
+        guard case .usable = await makeClient(store: store).restoreLocalEntitlement() else {
+            return XCTFail("An unchanged bound cache remains the local evidence after rejection")
+        }
     }
 
     func testStateWritesSerializeValidateThenActivate() async throws {
@@ -1780,6 +2264,7 @@ final class V1ContractTests: XCTestCase {
     private func makeToken(
         privateKey: Curve25519.Signing.PrivateKey,
         features: [String] = ["export"],
+        licenseExpiresAt: Date? = nil,
         legacyAccountClaim: Bool = false,
         legacyExpirationClaim: Date? = nil
     ) throws -> String {
@@ -1791,6 +2276,7 @@ final class V1ContractTests: XCTestCase {
             "lexp": NSNull(), "upd": NSNull(),
             "fea": features
         ]
+        if let licenseExpiresAt { payload["lexp"] = Int64(licenseExpiresAt.timeIntervalSince1970) }
         if legacyAccountClaim { payload["acc"] = "acc_legacy" }
         if let legacyExpirationClaim {
             payload["exp"] = Int64(legacyExpirationClaim.timeIntervalSince1970)

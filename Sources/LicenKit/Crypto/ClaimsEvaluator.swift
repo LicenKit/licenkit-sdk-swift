@@ -2,7 +2,7 @@ import Foundation
 
 enum SignedLicenseEvaluation: Equatable, Sendable {
     case active(claims: LicenseClaims)
-    case licenseExpired(expiresAt: Date)
+    case licenseExpired(claims: LicenseClaims)
 }
 
 struct ClaimsEvaluator: Sendable {
@@ -32,7 +32,7 @@ struct ClaimsEvaluator: Sendable {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token was issued in the future")
         }
         if let licenseExpiration = claims.licenseExpiresAt, licenseExpiration <= now {
-            return .licenseExpired(expiresAt: licenseExpiration)
+            return .licenseExpired(claims: claims)
         }
         return .active(claims: claims)
     }
