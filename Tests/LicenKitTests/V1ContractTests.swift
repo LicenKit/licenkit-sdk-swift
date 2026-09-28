@@ -9,8 +9,16 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
     private var trialVerifications: [String: StoredTrialVerification] = [:]
     private var trials: [String: StoredTrialCredentials] = [:]
     private var snapshots: [String: StoredEntitlementSnapshot] = [:]
+    private var validationAttempts: [String: StoredValidationAttempt] = [:]
     private var shouldFailNextLicenseSave = false
     private var shouldFailNextTrialSave = false
+
+    func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt? {
+        lock.withLock { validationAttempts[fingerprint] }
+    }
+    func saveValidationAttempt(_ attempt: StoredValidationAttempt, for fingerprint: String) throws {
+        lock.withLock { validationAttempts[fingerprint] = attempt }
+    }
 
     func failNextLicenseSave() {
         lock.withLock { shouldFailNextLicenseSave = true }
@@ -118,6 +126,7 @@ final class ContractURLProtocol: URLProtocol, @unchecked Sendable {
 
 final class V1ContractTests: XCTestCase {
     private let fingerprint = "sha256:test-device"
+    private let currentBuild = ValidationBuildIdentity(version: "2.4.0", platform: "macos", arch: "arm64")
     private let validatedAt = FlexibleDate.parseISO8601("2030-01-01T00:00:00Z")!
     private var session: URLSession!
 
@@ -157,7 +166,7 @@ final class V1ContractTests: XCTestCase {
             ),
         ] {
             setJSONResponse(data: validateData(state: ["kind": "activation_required", "trial": trial]))
-            let result = await makeClient(store: MemoryCredentialStore()).validate()
+            let result = await makeClient(store: MemoryCredentialStore()).validate(trigger: .silent)
             guard case .success(let snapshot, _) = result,
                   case .activationRequired(let actual) = snapshot.state else {
                 return XCTFail("Expected activationRequired, got \(result)")
@@ -186,7 +195,7 @@ final class V1ContractTests: XCTestCase {
             setJSONResponse(data: validateData(state: [
                 "kind": "activation_required", "trial": trial
             ]))
-            let result = await makeClient(store: MemoryCredentialStore()).validate()
+            let result = await makeClient(store: MemoryCredentialStore()).validate(trigger: .silent)
             guard case .failure(.protocolError, _, let metadata) = result else {
                 return XCTFail("Expected strict Trial reason/code protocol failure")
             }
@@ -205,7 +214,7 @@ final class V1ContractTests: XCTestCase {
             seenKind.set(credential["kind"] as? String)
             return self.response(data: self.validateData(state: self.licenseState()))
         }
-        let result = await makeClient(store: store).validate()
+        let result = await makeClient(store: store).validate(trigger: .silent)
         guard case .success(let snapshot, _) = result,
               case .license(.active) = snapshot.state else { return XCTFail("Expected License success") }
         XCTAssertEqual(seenKind.get(), "license")
@@ -229,7 +238,7 @@ final class V1ContractTests: XCTestCase {
             if status == "expired" { state["expires_at"] = iso(validatedAt.addingTimeInterval(-10)) }
             if status == "revoked" { state["reason"] = "abuse" }
             setJSONResponse(data: validateData(state: state))
-            let result = await makeClient(store: trialStore).validate()
+            let result = await makeClient(store: trialStore).validate(trigger: .silent)
             guard case .success(let snapshot, _) = result else { return XCTFail("Expected success") }
             XCTAssertEqual(snapshot.state, expected)
             XCTAssertEqual(snapshot.businessCode, code)
@@ -252,7 +261,7 @@ final class V1ContractTests: XCTestCase {
             if status == "suspended" { state["reason"] = "payment" }
             if status == "revoked" { state["reason"] = "refund" }
             setJSONResponse(data: validateData(state: state))
-            let result = await makeClient(store: store).validate()
+            let result = await makeClient(store: store).validate(trigger: .silent)
             guard case .success(let snapshot, _) = result else { return XCTFail("Expected success for \(code)") }
             XCTAssertEqual(snapshot.state, expected)
             XCTAssertEqual(snapshot.businessCode, code)
@@ -280,7 +289,7 @@ final class V1ContractTests: XCTestCase {
         setJSONResponse(data: validateData(state: state))
         let store = MemoryCredentialStore()
         try store.saveCredentials(opaqueCredentials(), for: fingerprint)
-        let result = await makeClient(store: store).validate()
+        let result = await makeClient(store: store).validate(trigger: .silent)
         guard case .success(let snapshot, _) = result else { return XCTFail("Expected success") }
         XCTAssertEqual(snapshot.state, expected)
     }
@@ -308,7 +317,7 @@ final class V1ContractTests: XCTestCase {
         ]
         for state in states {
             setJSONResponse(data: validateData(state: state))
-            let result = await makeClient(store: MemoryCredentialStore()).validate()
+            let result = await makeClient(store: MemoryCredentialStore()).validate(trigger: .silent)
             guard case .failure(.protocolError, _, let metadata) = result else {
                 return XCTFail("Expected missing License/version facts to fail")
             }
@@ -324,12 +333,12 @@ final class V1ContractTests: XCTestCase {
             interval: 3_600,
             lastValidateResponseAt: validatedAt
         )
-        try store.saveSnapshot(.init(subject: .license, snapshot: snapshot), for: fingerprint)
+        try store.saveSnapshot(.init(subject: .license, snapshot: snapshot, validatedBuild: currentBuild), for: fingerprint)
         let requests = LockedBox(0)
         setHandler { _ in requests.mutate { $0 += 1 }; return self.response(data: self.validateData(state: self.licenseState())) }
         let clock = MutableClock(validatedAt.addingTimeInterval(100))
-        let result = await makeClient(store: store, clock: clock).validate()
-        guard case .notPerformed(.cooldown, let cached, let metadata) = result else {
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
+        guard case .notPerformed(.productInterval, let cached, let metadata) = result else {
             return XCTFail("Expected cooldown")
         }
         XCTAssertEqual(requests.get(), 0)
@@ -351,7 +360,7 @@ final class V1ContractTests: XCTestCase {
             ]
         ]))
         let client = makeClient(store: store, clock: clock)
-        guard case .success(let first, _) = await client.validate() else {
+        guard case .success(let first, _) = await client.validate(trigger: .silent) else {
             return XCTFail("Expected the first no-credential validation to reach the Server")
         }
         XCTAssertEqual(first.lastValidateResponseAt, clock.now())
@@ -368,10 +377,206 @@ final class V1ContractTests: XCTestCase {
                 ]
             ]))
         }
-        guard case .notPerformed(.cooldown, _, _) = await client.validate() else {
+        guard case .notPerformed(.productInterval, _, _) = await client.validate(trigger: .silent) else {
             return XCTFail("Passing 30 seconds alone must not bypass the configured interval")
         }
         XCTAssertEqual(requests.get(), 0)
+    }
+
+    func testUserInitiatedValidationBypassesProductIntervalButReportsThirtySeconds() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(.init(
+            subject: .license,
+            snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600, lastValidateResponseAt: validatedAt),
+            validatedBuild: currentBuild
+        ), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            return self.response(data: self.validateData(state: self.licenseState()))
+        }
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        let client = makeClient(store: store, clock: clock)
+        guard case .success = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("A user action must bypass the Product interval")
+        }
+        XCTAssertEqual(requests.get(), 1)
+
+        clock.set(validatedAt.addingTimeInterval(120))
+        guard case .notPerformed(.minimumInterval(let retryAfter), _, _) = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("A user action must still obey the minimum interval")
+        }
+        XCTAssertEqual(retryAfter, 10, accuracy: 0.001)
+        XCTAssertEqual(NotPerformedReason.minimumInterval(retryAfter: retryAfter).code, "SDK_VALIDATION_MIN_INTERVAL")
+        XCTAssertEqual(requests.get(), 1)
+
+        clock.set(validatedAt.addingTimeInterval(131))
+        guard case .success = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("User validation must retry after 30 seconds")
+        }
+        XCTAssertEqual(requests.get(), 2)
+    }
+
+    func testSilentProductIntervalHasDistinctCode() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(.init(
+            subject: .license,
+            snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600, lastValidateResponseAt: validatedAt),
+            validatedBuild: currentBuild
+        ), for: fingerprint)
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        guard case .notPerformed(.productInterval(let nextEligibleAt), _, _) = await makeClient(
+            store: store, clock: clock
+        ).validate(trigger: .silent) else {
+            return XCTFail("A routine silent call must follow the Product interval")
+        }
+        XCTAssertEqual(nextEligibleAt, validatedAt.addingTimeInterval(3_600))
+        XCTAssertEqual(NotPerformedReason.productInterval(nextEligibleAt: nextEligibleAt).code, "SDK_VALIDATION_PRODUCT_INTERVAL")
+    }
+
+    func testMinimumIntervalStartsWhenRequestIsSentNotWhenResponseArrives() async throws {
+        let store = MemoryCredentialStore()
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            if requests.get() == 1 {
+                clock.set(self.validatedAt.addingTimeInterval(125))
+            }
+            return self.response(data: self.validateData(state: [
+                "kind": "activation_required",
+                "trial": ["status": "unavailable", "reason": "not_enabled", "code": "TRIAL_NOT_ENABLED"]
+            ]))
+        }
+        let client = makeClient(store: store, clock: clock)
+        guard case .success = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("Expected first user request")
+        }
+        XCTAssertEqual(try store.loadValidationAttempt(for: fingerprint)?.startedAt, validatedAt.addingTimeInterval(100))
+        clock.set(validatedAt.addingTimeInterval(131))
+        guard case .success = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("The 30-second interval must not restart when the response arrives")
+        }
+        XCTAssertEqual(requests.get(), 2)
+    }
+
+    func testDifferentTriggerRechecksAfterConcurrentSilentSkip() async {
+        let coordinator = OperationCoordinator()
+        let silentStarted = expectation(description: "silent decision started")
+        let releaseSilent = LockedBox<CheckedContinuation<Void, Never>?>(nil)
+        let snapshot = licenseSnapshot(validatedAt: validatedAt, interval: 3_600)
+        let nextEligibleAt = validatedAt.addingTimeInterval(3_600)
+        let silent = Task {
+            await coordinator.validate(trigger: .silent) {
+                await withCheckedContinuation { continuation in
+                    releaseSilent.set(continuation)
+                    silentStarted.fulfill()
+                }
+                return .notPerformed(
+                    reason: .productInterval(nextEligibleAt: nextEligibleAt),
+                    cachedValue: snapshot,
+                    metadata: OperationMetadata(source: .cache)
+                )
+            }
+        }
+        await fulfillment(of: [silentStarted], timeout: 1)
+        let manual = Task {
+            await coordinator.validate(trigger: .userInitiated) {
+                .success(value: snapshot, metadata: OperationMetadata(source: .server))
+            }
+        }
+        await Task.yield()
+        releaseSilent.get()?.resume()
+        _ = await silent.value
+        guard case .success = await manual.value else {
+            return XCTFail("A silent Product skip must not consume a user request")
+        }
+    }
+
+    func testOpaqueLicenseExpiryBypassesProductIntervalOnceEvenAfterTimeout() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        let expiry = validatedAt.addingTimeInterval(100)
+        let snapshot = EntitlementSnapshot(
+            state: .license(.active(terms: LicenseTerms(maxActivations: 1, features: ["export"], updatesUntil: nil), expiresAt: expiry)),
+            source: .server,
+            validatedAt: validatedAt,
+            receivedValidationInterval: 3_600,
+            effectiveValidationInterval: 3_600,
+            lastValidateResponseAt: validatedAt
+        )
+        try store.saveSnapshot(.init(subject: .license, snapshot: snapshot, validatedBuild: currentBuild), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.timedOut)
+        }
+        let clock = MutableClock(expiry.addingTimeInterval(1))
+        let client = makeClient(store: store, clock: clock)
+        XCTAssertFalse(snapshot.isUsable(at: clock.now()))
+        guard case .failure(.transportError(.timeout, _), _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("A newly expired opaque License must be checked early")
+        }
+        XCTAssertEqual(requests.get(), 1)
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .notPerformed(.productInterval, _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("The same expiry must not trigger repeated silent requests")
+        }
+        XCTAssertEqual(requests.get(), 1)
+    }
+
+    func testReleaseChangeBypassesProductIntervalOnceForOpaqueLicense() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveSnapshot(.init(
+            subject: .license,
+            snapshot: licenseSnapshot(validatedAt: validatedAt, interval: 3_600, lastValidateResponseAt: validatedAt),
+            validatedBuild: .init(version: "2.3.0", platform: "macos", arch: "arm64")
+        ), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.timedOut)
+        }
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        let client = makeClient(store: store, clock: clock)
+        guard case .failure(.transportError(.timeout, _), _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("A new Release identity must be checked early")
+        }
+        XCTAssertEqual(requests.get(), 1)
+        XCTAssertEqual(try store.loadValidationAttempt(for: fingerprint)?.build, currentBuild)
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .notPerformed(.productInterval, _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("The same Release change must not trigger repeated silent requests")
+        }
+        XCTAssertEqual(requests.get(), 1)
+    }
+
+    func testLegacySnapshotWithoutBuildIdentityGetsOneEarlyReview() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        let old = licenseSnapshot(validatedAt: validatedAt, interval: 3_600, lastValidateResponseAt: validatedAt)
+        let legacyData = try JSONEncoder().encode(StoredEntitlementSnapshot(subject: .license, snapshot: old))
+        let decoded = try JSONDecoder().decode(StoredEntitlementSnapshot.self, from: legacyData)
+        XCTAssertNil(decoded.validatedBuild)
+        try store.saveSnapshot(decoded, for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.timedOut)
+        }
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        let client = makeClient(store: store, clock: clock)
+        guard case .failure(.transportError(.timeout, _), _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("An old snapshot needs one Release identity review")
+        }
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .notPerformed(.productInterval, _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("A failed legacy review must not repeat on every silent call")
+        }
+        XCTAssertEqual(requests.get(), 1)
     }
 
     func testValidationIntervalRejectsLegacyNullAndOutOfRangeValues() async {
@@ -389,7 +594,7 @@ final class V1ContractTests: XCTestCase {
                 .transportError(.invalidResponse(let statusCode, _), _),
                 _,
                 _
-            ) = await makeClient(store: MemoryCredentialStore()).validate(),
+            ) = await makeClient(store: MemoryCredentialStore()).validate(trigger: .silent),
             statusCode == 200 else {
                 return XCTFail("Expected strict validation interval rejection")
             }
@@ -410,8 +615,8 @@ final class V1ContractTests: XCTestCase {
             ]))
         }
         let client = makeClient(store: MemoryCredentialStore())
-        async let first = client.validate()
-        async let second = client.validate()
+        async let first = client.validate(trigger: .silent)
+        async let second = client.validate(trigger: .silent)
         let results = await [first, second]
         XCTAssertEqual(requests.get(), 1)
         for result in results {
@@ -427,10 +632,10 @@ final class V1ContractTests: XCTestCase {
             interval: 3_600,
             lastValidateResponseAt: validatedAt
         )
-        try store.saveSnapshot(.init(subject: .license, snapshot: old), for: fingerprint)
+        try store.saveSnapshot(.init(subject: .license, snapshot: old, validatedBuild: currentBuild), for: fingerprint)
         setJSONError(status: 500, code: "DATABASE_UNAVAILABLE", requestID: "req_fail")
         let clock = MutableClock(validatedAt.addingTimeInterval(3_601))
-        let result = await makeClient(store: store, clock: clock).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(let error, let lastKnown, let metadata) = result else {
             return XCTFail("Expected failure")
         }
@@ -451,16 +656,16 @@ final class V1ContractTests: XCTestCase {
             requests.mutate { $0 += 1 }
             return self.response(data: self.validateData(state: self.licenseState()))
         }
-        guard case .notPerformed(.cooldown, _, _) = await makeClient(
+        guard case .notPerformed(.minimumInterval, _, _) = await makeClient(
             store: store,
             clock: clock
-        ).validate() else {
+        ).validate(trigger: .silent) else {
             return XCTFail("A definite HTTP failure must start the validate request cooldown")
         }
         XCTAssertEqual(requests.get(), 0)
     }
 
-    func testTrialExpiryDoesNotBypassConfiguredValidateCooldown() async throws {
+    func testTrialExpiryBypassesConfiguredIntervalOnce() async throws {
         let store = MemoryCredentialStore()
         try store.saveTrialCredentials(.init(trialID: "trl_1", trialToken: "ttk"), for: fingerprint)
         let expiry = validatedAt.addingTimeInterval(100)
@@ -472,7 +677,7 @@ final class V1ContractTests: XCTestCase {
             effectiveValidationInterval: 3_600,
             lastValidateResponseAt: validatedAt
         )
-        try store.saveSnapshot(.init(subject: .trial, snapshot: snapshot), for: fingerprint)
+        try store.saveSnapshot(.init(subject: .trial, snapshot: snapshot, validatedBuild: currentBuild), for: fingerprint)
         let requests = LockedBox(0)
         setHandler { _ in
             requests.mutate { $0 += 1 }
@@ -485,11 +690,17 @@ final class V1ContractTests: XCTestCase {
         let client = makeClient(store: store, clock: clock)
         XCTAssertFalse(snapshot.hasFeature("export", at: clock.now()))
         XCTAssertEqual(requests.get(), 0)
-        guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
-            return XCTFail("Trial expiry must not bypass the configured validate cooldown")
+        guard case .success(let confirmed, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("Trial expiry must trigger an early silent validation")
         }
-        XCTAssertFalse(cached?.isUsable(at: clock.now()) ?? true)
-        XCTAssertEqual(requests.get(), 0)
+        XCTAssertEqual(confirmed.businessCode, "TRIAL_EXPIRED")
+        XCTAssertFalse(confirmed.isUsable(at: clock.now()))
+        XCTAssertEqual(requests.get(), 1)
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .notPerformed(.productInterval, _, _) = await client.validate(trigger: .silent) else {
+            return XCTFail("A confirmed expired Trial must not continuously bypass the Product interval")
+        }
+        XCTAssertEqual(requests.get(), 1)
     }
 
     func testActivationUsesServerTimeButFirstValidateStillRequests() async throws {
@@ -510,7 +721,7 @@ final class V1ContractTests: XCTestCase {
 
         let requests = LockedBox(0)
         setHandler { _ in requests.mutate { $0 += 1 }; return self.response(data: self.validateData(state: self.licenseState())) }
-        guard case .success = await client.validate() else {
+        guard case .success = await client.validate(trigger: .silent) else {
             return XCTFail("Activation must not count as a validate response")
         }
         XCTAssertEqual(requests.get(), 1)
@@ -592,7 +803,7 @@ final class V1ContractTests: XCTestCase {
             XCTAssertEqual(credential["kind"] as? String, "none")
             return self.response(data: self.validateData(state: responseState))
         }
-        guard case .success = await makeClient(store: activationStore).validate() else {
+        guard case .success = await makeClient(store: activationStore).validate(trigger: .silent) else {
             return XCTFail("Expected validation without executing Activation")
         }
         XCTAssertNotNil(try activationStore.loadActivationVerification(for: fingerprint))
@@ -605,7 +816,7 @@ final class V1ContractTests: XCTestCase {
             XCTAssertEqual(credential["kind"] as? String, "none")
             return self.response(data: self.validateData(state: responseState))
         }
-        guard case .success = await makeClient(store: trialStore).validate() else {
+        guard case .success = await makeClient(store: trialStore).validate(trigger: .silent) else {
             return XCTFail("Expected validation without executing Trial claim")
         }
         XCTAssertNotNil(try trialStore.loadTrialVerification(for: fingerprint))
@@ -653,7 +864,7 @@ final class V1ContractTests: XCTestCase {
                 "features": ["trial_export"]
             ]))
         }
-        guard case .success = await makeClient(store: store).validate() else {
+        guard case .success = await makeClient(store: store).validate(trigger: .silent) else {
             return XCTFail("Trial claim must not count as a validate response")
         }
         XCTAssertEqual(requests.get(), 1)
@@ -743,7 +954,7 @@ final class V1ContractTests: XCTestCase {
                 ],
                 interval: received
             ))
-            let result = await makeClient(store: MemoryCredentialStore()).validate()
+            let result = await makeClient(store: MemoryCredentialStore()).validate(trigger: .silent)
             guard case .success(let snapshot, let metadata) = result else {
                 return XCTFail("Expected interval response")
             }
@@ -762,7 +973,7 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: validatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let requests = LockedBox(0)
@@ -771,10 +982,10 @@ final class V1ContractTests: XCTestCase {
             return self.response(data: self.validateData(state: self.licenseState()))
         }
         let clock = MutableClock(validatedAt.addingTimeInterval(-0.001))
-        guard case .notPerformed(.cooldown, _, _) = await makeClient(
+        guard case .notPerformed(.minimumInterval, _, _) = await makeClient(
             store: store,
             clock: clock
-        ).validate() else {
+        ).validate(trigger: .silent) else {
             return XCTFail("A backward wall clock must not defeat the request throttle")
         }
         XCTAssertEqual(requests.get(), 0)
@@ -790,7 +1001,7 @@ final class V1ContractTests: XCTestCase {
             "signing_key_id": "key_1"
         ]
         setJSONResponse(data: data)
-        let result = await makeClient(store: store).validate()
+        let result = await makeClient(store: store).validate(trigger: .silent)
         guard case .failure(.protocolError(let reason), _, let metadata) = result else {
             return XCTFail("Expected mode-change protocol failure")
         }
@@ -807,13 +1018,13 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: validatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let requests = LockedBox(0)
         setHandler { _ in requests.mutate { $0 += 1 }; return self.response(data: self.validateData(state: self.licenseState())) }
         let clock = MutableClock(validatedAt.addingTimeInterval(3_601))
-        guard case .success = await makeClient(store: store, clock: clock).validate() else {
+        guard case .success = await makeClient(store: store, clock: clock).validate(trigger: .silent) else {
             return XCTFail("Expected online validation")
         }
         XCTAssertEqual(requests.get(), 1)
@@ -833,7 +1044,7 @@ final class V1ContractTests: XCTestCase {
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
                 signedCredentialValid: true
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let requests = LockedBox(0)
@@ -846,8 +1057,8 @@ final class V1ContractTests: XCTestCase {
             store: store,
             clock: clock,
             signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
-        ).validate()
-        guard case .notPerformed(.cooldown, let cached, _) = result else {
+        ).validate(trigger: .silent)
+        guard case .notPerformed(.productInterval, let cached, _) = result else {
             return XCTFail("A valid Signed License must obey the configured interval")
         }
         XCTAssertEqual(cached?.source, .signedLocal)
@@ -869,7 +1080,7 @@ final class V1ContractTests: XCTestCase {
                 interval: 86_400,
                 lastValidateResponseAt: validatedAt,
                 signedCredentialValid: true
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let clock = MutableClock(validatedAt.addingTimeInterval(7_200))
@@ -883,7 +1094,7 @@ final class V1ContractTests: XCTestCase {
             clock: clock,
             signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         )
-        guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
+        guard case .notPerformed(.productInterval, let cached, _) = await client.validate(trigger: .silent) else {
             return XCTFail("Signed credentials must not acquire an independent expiry")
         }
         XCTAssertEqual(cached?.source, .signedLocal)
@@ -906,7 +1117,7 @@ final class V1ContractTests: XCTestCase {
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
                 signedCredentialValid: true
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let clock = MutableClock(validatedAt.addingTimeInterval(20))
@@ -920,17 +1131,47 @@ final class V1ContractTests: XCTestCase {
             clock: clock,
             signingPublicKey: unrelatedKey.publicKey.rawRepresentation.base64EncodedString()
         )
-        guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
+        guard case .notPerformed(.minimumInterval, let cached, _) = await client.validate(trigger: .silent) else {
             return XCTFail("A locally invalid signature must still obey the 30-second throttle")
         }
         XCTAssertEqual(cached?.signedCredentialValid, false)
         XCTAssertEqual(requests.get(), 0)
 
         clock.set(validatedAt.addingTimeInterval(31))
-        guard case .failure = await client.validate() else {
+        guard case .failure = await client.validate(trigger: .silent) else {
             return XCTFail("A locally invalid signature may request after 30 seconds")
         }
         XCTAssertEqual(requests.get(), 1)
+    }
+
+    func testMissingSigningKeyKeepsConfigurationErrorWithoutOnlineRetry() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(signedCredentials(token: try makeToken(privateKey: key)), for: fingerprint)
+        try store.saveSnapshot(.init(
+            subject: .license,
+            snapshot: licenseSnapshot(
+                validatedAt: validatedAt,
+                interval: 3_600,
+                lastValidateResponseAt: validatedAt,
+                signedCredentialValid: true
+            ),
+            validatedBuild: currentBuild
+        ), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            return self.response(data: self.validateData(state: self.licenseState()))
+        }
+        let clock = MutableClock(validatedAt.addingTimeInterval(100))
+        guard case .failure(.missingSigningPublicKey, let lastKnown, _) = await makeClient(
+            store: store, clock: clock
+        ).validate(trigger: .silent) else {
+            return XCTFail("A missing trusted key is a local configuration error")
+        }
+        XCTAssertEqual(lastKnown?.signedCredentialValid, false)
+        XCTAssertFalse(lastKnown?.isUsable(at: clock.now()) ?? true)
+        XCTAssertEqual(requests.get(), 0)
     }
 
     func testHTTP401StartsFullConfiguredCooldownForValidSignedCredential() async throws {
@@ -947,7 +1188,7 @@ final class V1ContractTests: XCTestCase {
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
                 signedCredentialValid: true
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         let clock = MutableClock(validatedAt.addingTimeInterval(3_601))
@@ -957,7 +1198,7 @@ final class V1ContractTests: XCTestCase {
             clock: clock,
             signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         )
-        guard case .failure(.apiError(let status, let code, _, let requestID, _), _, _) = await client.validate() else {
+        guard case .failure(.apiError(let status, let code, _, let requestID, _), _, _) = await client.validate(trigger: .silent) else {
             return XCTFail("Expected HTTP 401 API failure")
         }
         XCTAssertEqual(status, 401)
@@ -974,7 +1215,7 @@ final class V1ContractTests: XCTestCase {
             requests.mutate { $0 += 1 }
             throw URLError(.notConnectedToInternet)
         }
-        guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
+        guard case .notPerformed(.productInterval, let cached, _) = await client.validate(trigger: .silent) else {
             return XCTFail("HTTP 401 must start the full configured interval for a valid Signed Token")
         }
         XCTAssertEqual(cached?.signedCredentialValid, true)
@@ -1050,6 +1291,7 @@ final class V1ContractTests: XCTestCase {
 
     func testMalformedResponsePreservesHeaderRequestID() async throws {
         let store = MemoryCredentialStore()
+        let clock = MutableClock(validatedAt.addingTimeInterval(10))
         setHandler { request in
             let response = HTTPURLResponse(
                 url: request.url!, statusCode: 200, httpVersion: nil,
@@ -1057,7 +1299,7 @@ final class V1ContractTests: XCTestCase {
             )!
             return (response, Data("not-json".utf8))
         }
-        let result = await makeClient(store: store).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(.transportError(.invalidResponse(_, let requestID), _), _, let metadata) = result else {
             return XCTFail("Expected invalid response")
         }
@@ -1076,8 +1318,13 @@ final class V1ContractTests: XCTestCase {
                 ]
             ]))
         }
-        guard case .success = await makeClient(store: store).validate() else {
-            return XCTFail("Malformed HTTP 2xx data must not start a validate cooldown")
+        guard case .notPerformed(.minimumInterval, _, _) = await makeClient(store: store, clock: clock).validate(trigger: .silent) else {
+            return XCTFail("Malformed HTTP 2xx data must still count as a request attempt")
+        }
+        XCTAssertEqual(requests.get(), 0)
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .success = await makeClient(store: store, clock: clock).validate(trigger: .silent) else {
+            return XCTFail("Malformed HTTP 2xx data must not start the Product interval")
         }
         XCTAssertEqual(requests.get(), 1)
     }
@@ -1092,7 +1339,7 @@ final class V1ContractTests: XCTestCase {
             )!
             return (response, Data("not-json".utf8))
         }
-        let result = await makeClient(store: store, clock: clock).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(
             .transportError(.invalidResponse(let status, let requestID), _),
             let lastKnown,
@@ -1115,7 +1362,7 @@ final class V1ContractTests: XCTestCase {
         let store = MemoryCredentialStore()
         let clock = MutableClock(validatedAt.addingTimeInterval(10))
         setJSONError(status: 403, code: "LICENSE_SCOPE_DENIED", requestID: "req_403")
-        let result = await makeClient(store: store, clock: clock).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(
             .apiError(let status, let code, _, let requestID, let details),
             let lastKnown,
@@ -1142,10 +1389,10 @@ final class V1ContractTests: XCTestCase {
             ]))
         }
         clock.set(validatedAt.addingTimeInterval(41))
-        guard case .notPerformed(.cooldown, _, _) = await makeClient(
+        guard case .notPerformed(.productInterval, _, _) = await makeClient(
             store: store,
             clock: clock
-        ).validate() else {
+        ).validate(trigger: .silent) else {
             return XCTFail("An HTTP 403 must start the full configured cooldown")
         }
         XCTAssertEqual(requests.get(), 0)
@@ -1155,7 +1402,7 @@ final class V1ContractTests: XCTestCase {
         let store = MemoryCredentialStore()
         let clock = MutableClock(validatedAt.addingTimeInterval(10))
         setJSONError(status: 429, code: "RATE_LIMITED", requestID: "req_429")
-        let result = await makeClient(store: store, clock: clock).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(let error, let lastKnown, let metadata) = result else {
             return XCTFail("Expected HTTP 429 failure")
         }
@@ -1166,14 +1413,14 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(metadata.lastValidateResponseAt, clock.now())
     }
 
-    func testTimeoutWithoutHTTPResponseDoesNotStartCooldown() async throws {
+    func testTimeoutStartsMinimumIntervalButNotProductInterval() async throws {
         let store = MemoryCredentialStore()
         let clock = MutableClock(validatedAt.addingTimeInterval(10))
         setHandler { _ in throw URLError(.timedOut) }
         guard case .failure(.transportError(.timeout, _), _, _) = await makeClient(
             store: store,
             clock: clock
-        ).validate() else {
+        ).validate(trigger: .silent) else {
             return XCTFail("Expected timeout failure")
         }
         XCTAssertNil(try store.loadSnapshot(for: fingerprint))
@@ -1189,8 +1436,13 @@ final class V1ContractTests: XCTestCase {
                 ]
             ]))
         }
-        guard case .success = await makeClient(store: store, clock: clock).validate() else {
-            return XCTFail("The retry after a no-response failure must reach the Server")
+        guard case .notPerformed(.minimumInterval, _, _) = await makeClient(store: store, clock: clock).validate(trigger: .silent) else {
+            return XCTFail("A timeout still counts as a request attempt")
+        }
+        XCTAssertEqual(requests.get(), 0)
+        clock.set(clock.now().addingTimeInterval(31))
+        guard case .success = await makeClient(store: store, clock: clock).validate(trigger: .silent) else {
+            return XCTFail("A timeout must not start the Product interval")
         }
         XCTAssertEqual(requests.get(), 1)
     }
@@ -1204,13 +1456,13 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: oldValidatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: oldValidatedAt
-            )),
+            ), validatedBuild: currentBuild),
             for: fingerprint
         )
         store.failNextLicenseSave()
         setJSONResponse(data: validateData(state: licenseState()))
         let clock = MutableClock(validatedAt.addingTimeInterval(10))
-        let result = await makeClient(store: store, clock: clock).validate()
+        let result = await makeClient(store: store, clock: clock).validate(trigger: .silent)
         guard case .failure(
             .credentialStorageError(let operation, let status),
             let lastKnown,
@@ -1246,7 +1498,7 @@ final class V1ContractTests: XCTestCase {
             ])
         }
         let client = makeClient(store: store)
-        let validation = Task { await client.validate() }
+        let validation = Task { await client.validate(trigger: .silent) }
         await fulfillment(of: [validationStarted], timeout: 1)
         let deactivation = Task { await client.deactivate() }
         releaseValidation.signal()
@@ -1280,7 +1532,7 @@ final class V1ContractTests: XCTestCase {
             return self.response(data: self.activationData(activationID: "act_new", machineToken: "mtk_new"))
         }
         let client = makeClient(store: store)
-        let validation = Task { await client.validate() }
+        let validation = Task { await client.validate(trigger: .silent) }
         await fulfillment(of: [validationStarted], timeout: 1)
         let activation = Task { await client.activate(licenseKey: "NEW") }
         releaseValidation.signal()

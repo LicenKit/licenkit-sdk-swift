@@ -54,17 +54,43 @@ public enum StoredCredentialSubject: String, Codable, Equatable, Sendable {
     case none
 }
 
+public struct ValidationBuildIdentity: Codable, Equatable, Sendable {
+    public let version: String
+    public let platform: String
+    public let arch: String
+
+    public init(version: String, platform: String, arch: String) {
+        self.version = version
+        self.platform = platform
+        self.arch = arch
+    }
+}
+
+public struct StoredValidationAttempt: Codable, Equatable, Sendable {
+    public let startedAt: Date
+    public let build: ValidationBuildIdentity
+
+    public init(startedAt: Date, build: ValidationBuildIdentity) {
+        self.startedAt = startedAt
+        self.build = build
+    }
+}
+
 public struct StoredEntitlementSnapshot: Codable, Equatable, Sendable {
     public let subject: StoredCredentialSubject
     public let snapshot: EntitlementSnapshot
+    public let validatedBuild: ValidationBuildIdentity?
 
-    public init(subject: StoredCredentialSubject, snapshot: EntitlementSnapshot) {
+    public init(subject: StoredCredentialSubject, snapshot: EntitlementSnapshot, validatedBuild: ValidationBuildIdentity? = nil) {
         self.subject = subject
         self.snapshot = snapshot
+        self.validatedBuild = validatedBuild
     }
 }
 
 public protocol CredentialStore: Sendable {
+    func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt?
+    func saveValidationAttempt(_ attempt: StoredValidationAttempt, for fingerprint: String) throws
     func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification?
     func saveActivationVerification(_ verification: StoredActivationVerification, for fingerprint: String) throws
     func clearActivationVerification(for fingerprint: String) throws

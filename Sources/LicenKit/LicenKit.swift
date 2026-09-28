@@ -80,8 +80,16 @@ public final class LicenKit: @unchecked Sendable {
     }
 
     @discardableResult
+    @available(*, deprecated, message: "Specify .silent or .userInitiated with validate(trigger:).")
     public func validate() async -> LicenKitResult<EntitlementSnapshot> {
-        await operationCoordinator.validate { [self] in await performValidation() }
+        await validate(trigger: .silent)
+    }
+
+    @discardableResult
+    public func validate(trigger: ValidationTrigger) async -> LicenKitResult<EntitlementSnapshot> {
+        await operationCoordinator.validate(trigger: trigger) { [self] in
+            await performValidation(trigger: trigger)
+        }
     }
 
     @discardableResult
@@ -165,7 +173,7 @@ public final class LicenKit: @unchecked Sendable {
 
             try credentialStore.saveCredentials(credentials, for: fingerprint)
             try credentialStore.clearTrialCredentials(for: fingerprint)
-            try persist(snapshot: snapshot, subject: .license, fingerprint: fingerprint)
+            try persist(snapshot: snapshot, subject: .license, fingerprint: fingerprint, validatedBuild: .init(version: build.version, platform: build.platform, arch: build.arch))
             try credentialStore.clearActivationVerification(for: fingerprint)
             return .success(
                 value: ActivationData(
@@ -238,7 +246,7 @@ public final class LicenKit: @unchecked Sendable {
                 StoredTrialCredentials(trialID: response.trialID, trialToken: response.trialToken),
                 for: fingerprint
             )
-            try persist(snapshot: snapshot, subject: .trial, fingerprint: fingerprint)
+            try persist(snapshot: snapshot, subject: .trial, fingerprint: fingerprint, validatedBuild: .init(version: build.version, platform: build.platform, arch: build.arch))
             try credentialStore.clearTrialVerification(for: fingerprint)
             return .success(
                 value: snapshot,
@@ -258,7 +266,7 @@ public final class LicenKit: @unchecked Sendable {
         }
     }
 
-    private func performValidation() async -> LicenKitResult<EntitlementSnapshot> {
+    private func performValidation(trigger: ValidationTrigger) async -> LicenKitResult<EntitlementSnapshot> {
         var lastKnown = currentSnapshot
         var requestStarted = false
         var responseRequestID: String?
@@ -270,6 +278,7 @@ public final class LicenKit: @unchecked Sendable {
         var confirmedResponseSubject: StoredCredentialSubject?
         do {
             let build = try configuration.requireBuildIdentity()
+            let buildIdentity = ValidationBuildIdentity(version: build.version, platform: build.platform, arch: build.arch)
             let fingerprint = try await fingerprintProvider.getFingerprint()
             validationFingerprint = fingerprint
             let license = try credentialStore.loadCredentials(for: fingerprint)
@@ -297,23 +306,36 @@ public final class LicenKit: @unchecked Sendable {
                 lastKnown = stored.snapshot
                 setCurrentSnapshot(stored.snapshot)
             }
-            if let stored, stored.subject == subject {
-                let decision = validationCooldownDecision(
-                    snapshot: stored.snapshot,
-                    licenseCredentials: license,
-                    fingerprint: fingerprint
+            let attempt = try credentialStore.loadValidationAttempt(for: fingerprint)
+            let matchingStored = stored?.subject == subject ? stored : nil
+            let decision = validationCooldownDecision(
+                snapshot: matchingStored?.snapshot,
+                validatedBuild: matchingStored?.validatedBuild,
+                lastAttempt: attempt,
+                licenseCredentials: license,
+                fingerprint: fingerprint,
+                build: buildIdentity,
+                trigger: trigger
+            )
+            signedCredentialValid = decision.signedCredentialValid
+            if let cached = decision.cachedSnapshot {
+                lastKnown = cached
+                setCurrentSnapshot(cached)
+            }
+            if let localError = decision.localError { throw localError }
+            if let reason = decision.notPerformedReason {
+                return .notPerformed(
+                    reason: reason,
+                    cachedValue: decision.cachedSnapshot,
+                    metadata: decision.cachedSnapshot.map { operationMetadata(snapshot: $0, requestID: nil) }
+                        ?? OperationMetadata(source: .local)
                 )
-                signedCredentialValid = decision.signedCredentialValid
-                if let cached = decision.cooldownSnapshot {
-                    setCurrentSnapshot(cached)
-                    return .notPerformed(
-                        reason: .cooldown,
-                        cachedValue: cached,
-                        metadata: operationMetadata(snapshot: cached, requestID: nil)
-                    )
-                }
             }
 
+            try credentialStore.saveValidationAttempt(
+                StoredValidationAttempt(startedAt: now(), build: buildIdentity),
+                for: fingerprint
+            )
             requestStarted = true
             let response = try await apiClient.validate(request: APIValidateRequest(
                 productID: configuration.productID,
@@ -372,7 +394,7 @@ public final class LicenKit: @unchecked Sendable {
                 persistedSubject = .none
                 confirmedResponseSubject = .some(.none)
             }
-            try persist(snapshot: snapshot, subject: persistedSubject, fingerprint: fingerprint)
+            try persist(snapshot: snapshot, subject: persistedSubject, fingerprint: fingerprint, validatedBuild: buildIdentity)
             if persistedSubject == .license,
                let license,
                let verification = try credentialStore.loadActivationVerification(for: fingerprint),
@@ -415,7 +437,15 @@ public final class LicenKit: @unchecked Sendable {
                         try persist(
                             snapshot: receiptState.snapshot,
                             subject: receiptState.subject,
-                            fingerprint: fingerprint
+                            fingerprint: fingerprint,
+                            validatedBuild: confirmedResponseSnapshot == nil
+                                ? (validationStoredSnapshot?.subject == receiptState.subject
+                                    ? validationStoredSnapshot?.validatedBuild : nil)
+                                : ValidationBuildIdentity(
+                                    version: configuration.releaseVersion,
+                                    platform: configuration.releasePlatform,
+                                    arch: configuration.releaseArch
+                                )
                         )
                         lastKnown = receiptState.snapshot
                     } catch {
@@ -618,20 +648,27 @@ public final class LicenKit: @unchecked Sendable {
     }
 
     private struct ValidationCooldownDecision {
-        let cooldownSnapshot: EntitlementSnapshot?
+        let notPerformedReason: NotPerformedReason?
+        let cachedSnapshot: EntitlementSnapshot?
         let signedCredentialValid: Bool?
+        let localError: LicenKitError?
     }
 
     private func validationCooldownDecision(
-        snapshot: EntitlementSnapshot,
+        snapshot: EntitlementSnapshot?,
+        validatedBuild: ValidationBuildIdentity?,
+        lastAttempt: StoredValidationAttempt?,
         licenseCredentials: StoredCredentials?,
-        fingerprint: String
+        fingerprint: String,
+        build: ValidationBuildIdentity,
+        trigger: ValidationTrigger
     ) -> ValidationCooldownDecision {
-        var cached = snapshot.withSource(.cache)
+        var cached = snapshot?.withSource(.cache)
         var isSignedCredentialValid: Bool?
         var bypassConfiguredInterval = false
+        var localError: LicenKitError?
 
-        if let licenseCredentials, licenseCredentials.credentialMode == .signed {
+        if let snapshot, let licenseCredentials, licenseCredentials.credentialMode == .signed {
             do {
                 try validateSignedStateConsistency(
                     credentials: licenseCredentials,
@@ -645,26 +682,72 @@ public final class LicenKit: @unchecked Sendable {
                 cached = snapshot.withSignedCredentialValidity(true, source: source)
             } catch {
                 isSignedCredentialValid = false
-                bypassConfiguredInterval = true
                 cached = snapshot.withSignedCredentialValidity(false, source: .local)
+                if case LicenKitError.invalidSignedLicenseToken = error {
+                    bypassConfiguredInterval = true
+                } else {
+                    localError = normalize(error, operation: "local signed validation")
+                }
             }
         }
 
-        guard let lastResponseAt = snapshot.lastValidateResponseAt else {
+        if let localError {
             return ValidationCooldownDecision(
-                cooldownSnapshot: nil,
-                signedCredentialValid: isSignedCredentialValid
+                notPerformedReason: nil,
+                cachedSnapshot: cached,
+                signedCredentialValid: isSignedCredentialValid,
+                localError: localError
             )
         }
-        let elapsed = now().timeIntervalSince(lastResponseAt)
-        let minimumElapsed = elapsed >= Self.minimumValidationRequestInterval
-        let configuredInterval = snapshot.effectiveValidationInterval
-            ?? Self.defaultValidationInterval
-        let configuredElapsed = elapsed >= configuredInterval
-        let mayRequest = minimumElapsed && (bypassConfiguredInterval || configuredElapsed)
+
+        let currentTime = now()
+        // Old snapshots do not have an attempt record; preserve their remaining 30-second window.
+        let hardBaseline = lastAttempt?.startedAt ?? snapshot?.lastValidateResponseAt
+        if let hardBaseline {
+            let elapsed = currentTime.timeIntervalSince(hardBaseline)
+            if elapsed < Self.minimumValidationRequestInterval {
+                return ValidationCooldownDecision(
+                    notPerformedReason: .minimumInterval(
+                        retryAfter: Self.minimumValidationRequestInterval - elapsed
+                    ),
+                    cachedSnapshot: cached,
+                    signedCredentialValid: isSignedCredentialValid,
+                    localError: nil
+                )
+            }
+        }
+
+        guard trigger == .silent, let snapshot, let lastResponseAt = snapshot.lastValidateResponseAt else {
+            return ValidationCooldownDecision(
+                notPerformedReason: nil,
+                cachedSnapshot: cached,
+                signedCredentialValid: isSignedCredentialValid,
+                localError: nil
+            )
+        }
+        let expiry: Date?
+        switch snapshot.state {
+        case .trial(.active(let expiresAt, _)):
+            expiry = expiresAt
+        case .license(.active(_, let expiresAt)):
+            expiry = expiresAt
+        default:
+            expiry = nil
+        }
+        let crossedUnreviewedExpiry = expiry.map {
+            currentTime >= $0 && lastResponseAt < $0 && (lastAttempt?.startedAt ?? .distantPast) < $0
+        } ?? false
+        let unreviewedBuildChange = validatedBuild != build && lastAttempt?.build != build
+        let nextEligibleAt = lastResponseAt.addingTimeInterval(
+            snapshot.effectiveValidationInterval ?? Self.defaultValidationInterval
+        )
+        let mayRequest = bypassConfiguredInterval || crossedUnreviewedExpiry
+            || unreviewedBuildChange || currentTime >= nextEligibleAt
         return ValidationCooldownDecision(
-            cooldownSnapshot: mayRequest ? nil : cached,
-            signedCredentialValid: isSignedCredentialValid
+            notPerformedReason: mayRequest ? nil : .productInterval(nextEligibleAt: nextEligibleAt),
+            cachedSnapshot: cached,
+            signedCredentialValid: isSignedCredentialValid,
+            localError: nil
         )
     }
 
@@ -884,10 +967,11 @@ public final class LicenKit: @unchecked Sendable {
     private func persist(
         snapshot: EntitlementSnapshot,
         subject: StoredCredentialSubject,
-        fingerprint: String
+        fingerprint: String,
+        validatedBuild: ValidationBuildIdentity? = nil
     ) throws {
         try credentialStore.saveSnapshot(
-            StoredEntitlementSnapshot(subject: subject, snapshot: snapshot),
+            StoredEntitlementSnapshot(subject: subject, snapshot: snapshot, validatedBuild: validatedBuild),
             for: fingerprint
         )
         setCurrentSnapshot(snapshot)

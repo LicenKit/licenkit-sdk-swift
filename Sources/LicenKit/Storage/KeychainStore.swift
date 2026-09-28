@@ -8,6 +8,14 @@ public struct KeychainStore: CredentialStore, Sendable {
         self.service = "com.licenkit.client.\(productID)"
     }
 
+    public func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt? {
+        try read(StoredValidationAttempt.self, account: accountKey(prefix: "validation-attempt", fingerprint: fingerprint))
+    }
+
+    public func saveValidationAttempt(_ attempt: StoredValidationAttempt, for fingerprint: String) throws {
+        try write(attempt, account: accountKey(prefix: "validation-attempt", fingerprint: fingerprint))
+    }
+
     public func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification? {
         try read(StoredActivationVerification.self, account: accountKey(prefix: "activation-verification", fingerprint: fingerprint))
     }

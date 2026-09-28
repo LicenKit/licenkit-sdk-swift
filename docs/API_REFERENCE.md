@@ -32,7 +32,8 @@ public final class LicenKit: @unchecked Sendable {
     ) async -> LicenKitResult<ActivationData>
 
     public func startTrial() async -> LicenKitResult<EntitlementSnapshot>
-    public func validate() async -> LicenKitResult<EntitlementSnapshot>
+    public func validate(trigger: ValidationTrigger) async -> LicenKitResult<EntitlementSnapshot>
+    @available(*, deprecated) public func validate() async -> LicenKitResult<EntitlementSnapshot>
     public func deactivate() async -> LicenKitResult<DeactivationData>
     public func hasFeature(_ feature: String) -> Bool
     public func getMachineFingerprint() async throws -> String
@@ -45,7 +46,7 @@ public final class LicenKit: @unchecked Sendable {
 
 构建身份不再由业务代码传入。SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号，将操作系统标识为 `macos`，并根据主可执行文件架构单独推导 `arm64`、`x86_64` 或 `universal`；无法取得时返回 `.configurationError`。请求使用独立的 `release_version`、`release_platform` 与 `release_arch` 字段。请求超时固定为 SDK 内部的 15 秒，Keychain 使用当前 App 私有命名空间，不暴露 Access Group。
 
-`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动后应调用 `validate()` 加载持久化状态并执行必要的联网校验。
+`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动、进入前台、网络恢复时调用 `validate(trigger: .silent)`；用户点击“检查授权”“重试”，或因用户操作需要立即刷新授权时调用 `validate(trigger: .userInitiated)`。无参数 `validate()` 暂时按 `.silent` 执行，并已弃用；迁移时应显式标注调用意图。
 
 ## 操作结果
 
@@ -65,7 +66,14 @@ public enum LicenKitResult<Value: Sendable>: Sendable {
 }
 
 public enum NotPerformedReason: Equatable, Sendable {
-    case cooldown
+    case minimumInterval(retryAfter: TimeInterval)
+    case productInterval(nextEligibleAt: Date)
+    public var code: String { get }
+}
+
+public enum ValidationTrigger: Equatable, Sendable {
+    case silent
+    case userInitiated
 }
 
 public struct OperationMetadata: Equatable, Sendable {
@@ -79,7 +87,8 @@ public struct OperationMetadata: Equatable, Sendable {
 ```
 
 - `.success`：操作已完成；仍须读取快照中的业务状态，不能把 HTTP 成功等同于授权可用。
-- `.notPerformed(.cooldown, ...)`：`validate()` 命中适用的请求门槛，因此没有发起新请求。这不表示 SDK 安排了稍后的自动请求。
+- `.notPerformed(.minimumInterval(retryAfter:), ...)`：距上次真正发出的 `/validate` 请求尚未满 30 秒，`code` 为 `SDK_VALIDATION_MIN_INTERVAL`。用户主动操作时可提示稍后重试。
+- `.notPerformed(.productInterval(nextEligibleAt:), ...)`：静默调用距上次明确服务端响应尚未达到 Product 间隔，`code` 为 `SDK_VALIDATION_PRODUCT_INTERVAL`。用户主动调用不会得到此结果。这两种结果都没有发起新请求，也没有 Request ID；服务端 HTTP 429 仍按原始错误返回 `.failure`。
 - `.failure`：调用失败；`lastKnownValue` 是诊断和展示上下文，不是本次成功结果。
 
 ## 授权状态
@@ -168,7 +177,11 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
 
 在线校验间隔由服务端必填，范围为 3600 至 86400 秒。间隔内为 `fresh`；间隔后、License 离线宽限期前为 `offlineGrace`；超过宽限期为 `offlineGraceExceeded`。新鲜度不决定可用性：活动状态在业务未到期且 Signed 凭据未被判定无效时，`isUsable` 仍返回 `true`；`hasFeature` 还要求功能名存在于 Trial features 或 License terms 中。
 
-请求冷却与业务新鲜度分开保存。`lastValidateResponseAt` 是两个门槛的共同起点；`signedCredentialValid` 为 `true/false` 时表示本地 Signed 凭据本轮验证成功/失败，非 Signed 或尚无结论时可以为空。`validate()` 的普通路径必须同时越过 Product 在线复核间隔和公开常量 `minimumValidationRequestInterval`（当前为 30 秒）；Signed Token 本地验证失败时只绕过前者。合法业务成功和明确 HTTP 失败会推进最近响应时间；无 HTTP 响应的传输失败与 2xx 非法业务数据不会推进。HTTP 失败不推进 `validatedAt`。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
+请求门槛与业务新鲜度分开保存。固定 30 秒从持久化的最近一次实际 `/validate` 请求发出时间计算；请求即使超时、断网或收到非法正文，也会启动这条门槛。升级前没有请求记录的旧快照暂用 `lastValidateResponseAt` 保留其尚未结束的 30 秒窗口。Product 间隔只在静默调用时，从 `lastValidateResponseAt` 计算；合法业务成功与明确 HTTP 失败推进该时间，无 HTTP 响应与非法 2xx 正文不推进。HTTP 失败不推进 `validatedAt`。
+
+用户主动调用始终豁免 Product 间隔。静默调用在缓存的 active Trial/License 首次跨过已知业务截止时间、宿主 Release 版本/平台/架构变化后首次复核，或 Signed Token 本地失效时也豁免。到期和构建身份变化的豁免只各触发一次请求尝试；收到服务端到期终态或一次失败后，不因同一个事实持续静默请求。旧快照缺少构建身份时允许一次提前复核；该迁移不会自行改变缓存授权的可用性。缺少或无效的内置签名公钥属于配置错误，保留原始诊断，不靠在线重试修复。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
+
+自定义 `CredentialStore` 实现需要读写 `StoredValidationAttempt`；该记录按 Product 与设备指纹保存请求发出时间及当前 Release 身份，不包含 License Key 或 Token。`StoredEntitlementSnapshot.validatedBuild` 是可选字段，以便解码升级前的快照。
 
 `businessCode` 与 `details` 保存业务终态的原始诊断信息；其中敏感字段按字段递归脱敏。
 

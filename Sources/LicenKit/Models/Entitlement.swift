@@ -9,7 +9,20 @@ public enum LicenKitResult<Value: Sendable>: Sendable {
 extension LicenKitResult: Equatable where Value: Equatable {}
 
 public enum NotPerformedReason: Equatable, Sendable {
-    case cooldown
+    case minimumInterval(retryAfter: TimeInterval)
+    case productInterval(nextEligibleAt: Date)
+
+    public var code: String {
+        switch self {
+        case .minimumInterval: return "SDK_VALIDATION_MIN_INTERVAL"
+        case .productInterval: return "SDK_VALIDATION_PRODUCT_INTERVAL"
+        }
+    }
+}
+
+public enum ValidationTrigger: Equatable, Sendable {
+    case silent
+    case userInitiated
 }
 
 public struct OperationMetadata: Equatable, Sendable {

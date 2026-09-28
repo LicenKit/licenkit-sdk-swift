@@ -4,12 +4,22 @@ actor OperationCoordinator {
     private typealias ValidationTask = Task<LicenKitResult<EntitlementSnapshot>, Never>
     private var tail: Task<Void, Never>?
     private var validationGeneration = 0
-    private var activeValidation: (generation: Int, task: ValidationTask)?
+    private var activeValidation: (generation: Int, trigger: ValidationTrigger, task: ValidationTask)?
 
     func validate(
+        trigger: ValidationTrigger,
         _ operation: @Sendable @escaping () async -> LicenKitResult<EntitlementSnapshot>
     ) async -> LicenKitResult<EntitlementSnapshot> {
-        if let activeValidation { return await activeValidation.task.value }
+        if let activeValidation {
+            let result = await activeValidation.task.value
+            if activeValidation.trigger != trigger, case .notPerformed = result {
+                if self.activeValidation?.generation == activeValidation.generation {
+                    self.activeValidation = nil
+                }
+                return await validate(trigger: trigger, operation)
+            }
+            return result
+        }
 
         let previous = tail
         validationGeneration += 1
@@ -18,7 +28,7 @@ actor OperationCoordinator {
             if let previous { await previous.value }
             return await operation()
         }
-        activeValidation = (generation, task)
+        activeValidation = (generation, trigger, task)
         tail = Task { _ = await task.value }
         let result = await task.value
         if activeValidation?.generation == generation { activeValidation = nil }

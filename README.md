@@ -22,16 +22,22 @@ let configuration = LicenKitConfiguration(
 
 LicenKit.configure(with: configuration)
 
-switch await LicenKit.shared.validate() {
+switch await LicenKit.shared.validate(trigger: .silent) {
 case .success(let snapshot, let metadata):
     print(snapshot.state, metadata.requestID as Any)
 
-case .notPerformed(.cooldown, let cached, _):
+case .notPerformed(.minimumInterval(let retryAfter), let cached, _):
+    print("校验请求需等待 \(retryAfter) 秒", cached?.state as Any)
+
+case .notPerformed(.productInterval, let cached, _):
     print(cached?.state as Any)
 
 case .failure(let error, let lastKnown, let metadata):
     print(error, lastKnown?.state as Any, metadata.requestID as Any)
 }
+
+// 用户点击“检查授权”或“重试”时使用 .userInitiated。
+let manualResult = await LicenKit.shared.validate(trigger: .userInitiated)
 ```
 
 公共初始化参数只有：
@@ -55,8 +61,10 @@ let deactivation = await LicenKit.shared.deactivate()
 ## 宿主应用应遵守的边界
 
 - 只在 `EntitlementSnapshot.isUsable(at:)` 为 `true` 时启用授权功能。在线复核间隔与离线宽限期只决定联网调度和提示强度，不会单独停用授权。
-- `validate()` 同时执行 Product 在线复核间隔与硬编码 30 秒门槛；Signed Token 本地验证失败时只绕过前者。命中门槛时返回 `.notPerformed(.cooldown, ...)`，并发调用共享同一请求 Task。
-- 冷却只约束 `validate()`；`activate()`、`startTrial()` 与 `deactivate()` 不受限制，也不会启动该冷却。SDK 不在门槛结束时自动联网。
+- `validate(trigger:)` 明确区分宿主静默复核与用户主动复核。所有新请求均受固定 30 秒限制；Product 在线复核间隔只限制静默调用。已知 Trial/License 首次到期、Release 身份变化后首次复核，以及 Signed Token 本地失效时，静默调用可跳过 Product 间隔。
+- 两种未执行原因分别为 `.minimumInterval` 与 `.productInterval`，对应独立的 SDK 本地代码；前者可在用户主动操作时提示剩余等待时间，后者通常无需展示。命中任一门槛都不发网络请求。
+- 30 秒从上次实际发出 `/validate` 请求时起算，包括随后超时或收到非法响应的请求；Product 间隔仍从上次明确服务端响应时起算。并发请求共享结果；静默跳过不会吞掉用户主动复核。
+- 两种门槛只约束 `validate`；`activate()`、`startTrial()` 与 `deactivate()` 不受限制，也不会启动该冷却。SDK 不在门槛结束时自动联网。
 - 合法 `/validate` 业务响应和明确 HTTP 失败会更新最近响应时间；DNS/TLS/超时等无 HTTP 响应失败及 2xx 非法正文不会更新。HTTP 失败不推进 `validatedAt`。
 - `failure.lastKnownValue` 只用于展示和故障上下文，不能冒充本次校验成功。
 - `businessCode`、安全的 `details` 与 `OperationMetadata.requestID` 应进入诊断链路；Registration Key、Machine Token、Trial Token 和 Signed Token 不得写入日志。

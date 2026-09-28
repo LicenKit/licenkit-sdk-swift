@@ -9,10 +9,10 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
 ## 模块职责
 
 - `LicenKit`：面向宿主 App 的 Facade，组织激活、统一校验、Trial 领取、解绑和快照读取，不包含 UI。
-- `OperationCoordinator`：顺序化会修改凭据或快照的操作；并发 `validate()` 共享同一 Task。
+- `OperationCoordinator`：顺序化会修改凭据或快照的操作；同期实际校验请求共享同一 Task，静默跳过不会吞掉用户主动校验。
 - `LicenKitAPIClient`：实现 V1 JSON Envelope，区分传输错误、API 错误和协议错误，并保留 Request ID 与安全 details。
 - `EntitlementSnapshot`：统一保存业务状态、来源、新鲜度边界、业务码和诊断信息。
-- `CredentialStore` / `KeychainStore`：分别保存 License、Trial 与快照；秘密不进入普通偏好设置。
+- `CredentialStore` / `KeychainStore`：分别保存 License、Trial、快照和最近一次校验请求尝试；秘密不进入普通偏好设置。
 - `Ed25519Verifier`：使用宿主内置的单个 Ed25519 公钥验证 `signed` 模式紧凑 JWS，并校验响应 Key ID 与 Token `kid` 一致。
 - `ClaimsEvaluator`：核对 Product、Activation、设备、版本、操作系统、架构与各层到期时间；Instance 由 Server 通过全局唯一 Product ID 解析。
 - `MacOSFingerprintProvider`：生成稳定设备指纹。
@@ -24,12 +24,13 @@ SDK 的核心不是“缓存一个布尔值”，而是保存一份带来源、�
   │
   ├─ activate / startTrial / deactivate ─┐
   │                                      ├─ OperationCoordinator
-  └─ validate ── 同期调用共享一个 Task ─┘
+  └─ validate(trigger: .silent / .userInitiated) ─┘
                      │
                      ├─ 读取 Keychain 中的 License / Trial / none
-                     ├─ 检查 lastValidateResponseAt 与适用的两个门槛
-                     ├─ 命中门槛 → notPerformed(cooldown)
-                     └─ 门槛已结束 → /client/validate
+                     ├─ 检查最近请求尝试 + 固定 30 秒
+                     ├─ 静默调用再检查 Product 间隔及豁免条件
+                     ├─ 命中门槛 → notPerformed(minimumInterval / productInterval)
+                     └─ 记录请求尝试 → /client/validate
                                       │
                                       ├─ state：统一业务状态
                                       ├─ validation：服务端时间与建议间隔
@@ -56,9 +57,11 @@ SDK 分两层表达事实：
 
 `isUsable(at:)` 由 active 业务状态、Trial/License 业务到期和 Signed 凭据是否有效决定。超过在线复核间隔或离线宽限期仍可用；服务端返回的 License `expires_at` 已包含支付订阅的支付宽限，客户端不重复计算。
 
-业务新鲜度与请求冷却不是同一状态。`validatedAt` 来自合法业务响应；`lastValidateResponseAt` 表示最近一次取得明确 `/validate` Server 结果的本地时间。普通路径同时检查 `lastValidateResponseAt + effectiveInterval` 与 `lastValidateResponseAt + 30 seconds`。Signed Token 本地验证失败时跳过前者，但仍检查后者。
+业务新鲜度与请求门槛不是同一状态。`validatedAt` 来自合法业务响应；`lastValidateResponseAt` 表示最近一次取得明确 `/validate` Server 结果的本地时间，是静默 Product 间隔的起点。单独保存的 `StoredValidationAttempt.startedAt` 是固定 30 秒门槛的起点，请求发起前写入，因此无响应失败和非法 2xx 正文也受 30 秒限制。旧快照尚无请求尝试记录时，暂用其 `lastValidateResponseAt` 保留原有 30 秒窗口。
 
-只有两类 `/validate` 结果会写 `lastValidateResponseAt`：合法的成功业务数据，以及具有明确 HTTP 状态的失败。DNS、TLS、超时、断网等没有 HTTP 响应的失败和 2xx 非法业务数据不写该时间；HTTP 失败也不写 `validatedAt` 或新业务快照。`activate()`、`startTrial()` 和 `deactivate()` 不读写请求冷却时间。
+Product 间隔仅限制 `.silent`：用户主动校验、active Trial/License 首次跨过已知业务到期、Release 身份变化后首次静默复核，以及 Signed Token 本地失效均可跳过。到期和 Release 身份变化以最近请求尝试为一次性标记，即使请求超时，也不会因同一条件每 30 秒反复静默请求。快照保存生成可信服务端状态时的版本、平台和架构；旧快照缺少该身份时允许一次静默复核。Signed 凭据缺少内置公钥或公钥配置无效则保留配置错误，不当作可通过联网修复的 Token 失效。
+
+只有两类 `/validate` 结果会写 `lastValidateResponseAt`：合法的成功业务数据，以及具有明确 HTTP 状态的失败。DNS、TLS、超时、断网等没有 HTTP 响应的失败和 2xx 非法业务数据不写该时间；HTTP 失败也不写 `validatedAt` 或新业务快照。所有实际请求尝试都会先写 `StoredValidationAttempt`。`activate()`、`startTrial()` 和 `deactivate()` 不读写请求门槛时间。
 
 ## 来源语义
 
@@ -101,7 +104,7 @@ Machine Token 与 Trial Token 是 bearer credential：安全性来自 256 位 CS
 
 ## 被动冷却边界
 
-冷却只在宿主主动调用 `validate()` 时判断。门槛结束不会创建后台任务、监听网络恢复、发出事件或自动重试。显式激活、Trial 领取和解绑始终执行自身操作；它们返回的 `validatedAt` 是业务事实，不能冒充 `/validate` 最近响应时间。
+门槛只在宿主调用 `validate(trigger:)` 时判断。`.silent` 表示应用启动、前台切换等无用户刷新意图的调用；`.userInitiated` 表示用户明确点击检查或重试。门槛结束不会创建后台任务、监听网络恢复、发出事件或自动重试。显式激活、Trial 领取和解绑始终执行自身操作；它们返回的 `validatedAt` 是业务事实，不能冒充 `/validate` 最近响应时间。
 
 ## 错误、诊断与脱敏
 

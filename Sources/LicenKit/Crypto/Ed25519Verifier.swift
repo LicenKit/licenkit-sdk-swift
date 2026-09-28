@@ -50,7 +50,7 @@ public struct Ed25519Verifier: Sendable {
         let keyData = try extractRawEd25519PublicKey(from: signingPublicKey)
         let verifier: Curve25519.Signing.PublicKey
         do { verifier = try Curve25519.Signing.PublicKey(rawRepresentation: keyData) }
-        catch { throw LicenKitError.invalidSignedLicenseToken(reason: "trusted Ed25519 public key is invalid") }
+        catch { throw LicenKitError.configurationError(reason: "trusted Ed25519 public key is invalid") }
         let signedData = Data("\(parts[0]).\(parts[1])".utf8)
         guard verifier.isValidSignature(signature, for: signedData) else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Ed25519 signature verification failed")
@@ -89,12 +89,12 @@ public struct Ed25519Verifier: Sendable {
             .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
             .components(separatedBy: .whitespacesAndNewlines).joined()
         guard let data = Data(base64Encoded: cleaned) else {
-            throw LicenKitError.invalidSignedLicenseToken(reason: "trusted public key is not valid Base64")
+            throw LicenKitError.configurationError(reason: "trusted public key is not valid Base64")
         }
         if data.count == 32 { return data }
         let prefix = Data([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00])
         if data.count == 44, data.prefix(prefix.count) == prefix { return data.suffix(32) }
-        throw LicenKitError.invalidSignedLicenseToken(reason: "trusted public key must be raw 32-byte or Ed25519 SPKI data")
+        throw LicenKitError.configurationError(reason: "trusted public key must be raw 32-byte or Ed25519 SPKI data")
     }
 
     public func decodeBase64URL(_ value: String) -> Data? {
