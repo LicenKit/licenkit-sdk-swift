@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-28
+
+### Added
+- **Pending Verification Token Persistence**:
+  - Activation and trial claims now persist a client-generated 256-bit CSPRNG verification token (`StoredActivationVerification`, `StoredTrialVerification`) before network requests.
+  - When responses are lost or subsequent credential writes fail, retrying `activate()` or `startTrial()` reuses the pending token for idempotency across process restarts without leaking registration keys or hashes.
+  - Added verification storage APIs to `CredentialStore` and `KeychainStore`.
+- **Offline Grace Period**:
+  - Added `offlineGrace(until: Date)` and `offlineGraceExceeded(since: Date)` freshness states to `EntitlementFreshness`.
+  - Added `offlineGracePeriod` to `EntitlementSnapshot` and `OperationMetadata`, populated from the server's `offline_grace_seconds`.
+  - Offline grace period applies equally to opaque and signed credentials.
+
+### Changed
+- **Signed License Token Contract Alignment**:
+  - Removed legacy `exp` (token expiry) claim from `LicenseClaims` and signed license tokens; signed credentials no longer maintain an independent token expiry.
+  - Usability of active entitlements is now governed solely by business validity/expiry and signed credential validity, with validation intervals and offline grace periods governing freshness and validation scheduling.
+
 ## [0.5.0] - 2026-09-28
 
 ### Changed
