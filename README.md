@@ -42,7 +42,7 @@ case .failure(let error, let lastKnown, let metadata):
 
 SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号；操作系统固定识别为 `macos`，主可执行文件架构单独推导为 `arm64`、`x86_64` 或 `universal`。这些值作为 `release_version + release_platform + release_arch` 随请求发送，但宿主业务代码不需要配置。缺少构建信息时操作会明确返回配置错误。网络超时固定为 SDK 内部的 15 秒；Keychain 只供当前 App 使用，不暴露 Access Group 配置。
 
-Product Release 不是所有授权的前置登记表。只有永久授权同时存在 `updates_until` 时，Server 才尝试用这组构建身份查询发布时间；未登记时按宽容策略继续放行，查到且 `released_at > updates_until` 时才返回需要更新权益。Signed License Token 不包含 Release ID 或发布时间，本地只验证签名、构建身份、设备绑定和 Token/License 自身期限。
+Product Release 不是所有授权的前置登记表。只有永久授权同时存在 `updates_until` 时，Server 才尝试用这组构建身份查询发布时间；未登记时按宽容策略继续放行，查到且 `released_at > updates_until` 时才返回需要更新权益。Signed License Token 不包含 Release ID、发布时间或独立 `exp`，本地只验证签名、构建身份、设备绑定和 License 业务期限。
 
 写操作也返回显式结果，不通过 `throws` 隐藏上次状态：
 
@@ -54,14 +54,15 @@ let deactivation = await LicenKit.shared.deactivate()
 
 ## 宿主应用应遵守的边界
 
-- 只在 `EntitlementSnapshot.isUsable(at:)` 为 `true` 时启用授权功能；`state` 为 active 并不自动绕过校验窗口或 Token 到期。
-- `validate()` 同时执行 Server 建议间隔与硬编码 30 秒门槛；Signed Token 过期或无效只绕过建议间隔。命中门槛时返回 `.notPerformed(.cooldown, ...)`，并发调用共享同一请求 Task。
+- 只在 `EntitlementSnapshot.isUsable(at:)` 为 `true` 时启用授权功能。在线复核间隔与离线宽限期只决定联网调度和提示强度，不会单独停用授权。
+- `validate()` 同时执行 Product 在线复核间隔与硬编码 30 秒门槛；Signed Token 本地验证失败时只绕过前者。命中门槛时返回 `.notPerformed(.cooldown, ...)`，并发调用共享同一请求 Task。
 - 冷却只约束 `validate()`；`activate()`、`startTrial()` 与 `deactivate()` 不受限制，也不会启动该冷却。SDK 不在门槛结束时自动联网。
 - 合法 `/validate` 业务响应和明确 HTTP 失败会更新最近响应时间；DNS/TLS/超时等无 HTTP 响应失败及 2xx 非法正文不会更新。HTTP 失败不推进 `validatedAt`。
 - `failure.lastKnownValue` 只用于展示和故障上下文，不能冒充本次校验成功。
 - `businessCode`、安全的 `details` 与 `OperationMetadata.requestID` 应进入诊断链路；Registration Key、Machine Token、Trial Token 和 Signed Token 不得写入日志。
 - `deactivate()` 仅在服务端确认后清除 License 凭据；远端失败时保留 Machine Token 以便重试。
-- Signed Token Payload 只保存绝对 `exp`；明文到期字段必须与 `exp` 对齐。`exp` 取“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值；Plan 的原始 TTL 不进入 Token，也不要求覆盖 3600 秒建议间隔。
+- Signed Token 不含 `exp`。Product 的 `validation_interval_seconds` 控制在线复核尝试频率；License Plan 的 `offline_grace_seconds` 在签发时固化到 License，超过后返回 `offlineGraceExceeded` 强提示但仍允许使用。
+- `activate()` 与 `startTrial()` 在请求前把客户端生成的 Token 写为验证中凭据；响应丢失、进程退出或最终凭据写入失败后，显式重试会复用同一 Token，由服务端重复下发同一份正式凭据。`validate()` 不执行这两个动作，其他设备不能只凭注册码或相同指纹取得既有凭据。
 - Product/设备 Trial 不等于 Paddle 免费订阅试用。后者得到普通 License Key，应调用 `activate()`。
 
 ## 文档

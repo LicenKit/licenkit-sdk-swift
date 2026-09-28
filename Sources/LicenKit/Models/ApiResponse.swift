@@ -153,29 +153,49 @@ public struct APIResponseMetadata: Codable, Equatable, Sendable {
 }
 
 public struct APIValidationMetadata: Codable, Equatable, Sendable {
-    public let validationIntervalSeconds: TimeInterval?
+    public let validationIntervalSeconds: TimeInterval
+    public let offlineGraceSeconds: TimeInterval?
     public let validatedAt: FlexibleDate
 
     enum CodingKeys: String, CodingKey {
         case validationIntervalSeconds = "validation_interval_seconds"
+        case offlineGraceSeconds = "offline_grace_seconds"
         case validatedAt = "validated_at"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        guard container.contains(.validationIntervalSeconds) else {
-            throw DecodingError.keyNotFound(
-                CodingKeys.validationIntervalSeconds,
-                .init(
-                    codingPath: container.codingPath,
-                    debugDescription: "validation_interval_seconds must be present; null means SDK default"
-                )
-            )
-        }
-        validationIntervalSeconds = try container.decodeIfPresent(
+        validationIntervalSeconds = try container.decode(
             TimeInterval.self,
             forKey: .validationIntervalSeconds
         )
+        guard validationIntervalSeconds >= 3_600, validationIntervalSeconds <= 86_400 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .validationIntervalSeconds,
+                in: container,
+                debugDescription: "validation_interval_seconds must be between 3600 and 86400"
+            )
+        }
+        guard container.contains(.offlineGraceSeconds) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.offlineGraceSeconds,
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "offline_grace_seconds must be present"
+                )
+            )
+        }
+        offlineGraceSeconds = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .offlineGraceSeconds
+        )
+        if let offlineGraceSeconds, offlineGraceSeconds <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .offlineGraceSeconds,
+                in: container,
+                debugDescription: "offline_grace_seconds must be positive when present"
+            )
+        }
         validatedAt = try container.decode(FlexibleDate.self, forKey: .validatedAt)
     }
 }
@@ -242,6 +262,7 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
 public struct APIActivateRequest: Codable, Sendable {
     public let productID: String
     public let licenseKey: String
+    public let machineToken: String
     public let fingerprint: String
     public let devicePlatform: String
     public let name: String?
@@ -252,6 +273,7 @@ public struct APIActivateRequest: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
         case licenseKey = "license_key"
+        case machineToken = "machine_token"
         case fingerprint
         case devicePlatform = "device_platform"
         case name
@@ -266,7 +288,6 @@ public struct APICredentialResponse: Codable, Sendable {
     public let machineToken: String
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
-    public let signedLicenseTokenExpiresAt: FlexibleDate?
     public let signingKeyID: String?
     public let licenseExpiresAt: FlexibleDate?
     public let terms: LicenseTerms
@@ -279,7 +300,6 @@ public struct APICredentialResponse: Codable, Sendable {
         case machineToken = "machine_token"
         case credentialMode = "credential_mode"
         case signedLicenseToken = "signed_license_token"
-        case signedLicenseTokenExpiresAt = "signed_license_token_expires_at"
         case signingKeyID = "signing_key_id"
         case licenseExpiresAt = "license_expires_at"
         case terms, state, validation, meta
@@ -337,13 +357,11 @@ public struct APIValidateRequest: Encodable, Sendable {
 public struct APICredentialUpdate: Codable, Sendable {
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
-    public let signedLicenseTokenExpiresAt: FlexibleDate?
     public let signingKeyID: String?
 
     enum CodingKeys: String, CodingKey {
         case credentialMode = "credential_mode"
         case signedLicenseToken = "signed_license_token"
-        case signedLicenseTokenExpiresAt = "signed_license_token_expires_at"
         case signingKeyID = "signing_key_id"
     }
 }
@@ -388,6 +406,7 @@ public struct APIDeactivateResponse: Codable, Sendable {
 public struct APITrialClaimRequest: Codable, Sendable {
     public let productID: String
     public let fingerprint: String
+    public let trialToken: String
     public let devicePlatform: String
     public let releaseVersion: String
     public let releasePlatform: String
@@ -396,6 +415,7 @@ public struct APITrialClaimRequest: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
         case fingerprint
+        case trialToken = "trial_token"
         case devicePlatform = "device_platform"
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
@@ -405,7 +425,7 @@ public struct APITrialClaimRequest: Codable, Sendable {
 
 public struct APITrialClaimResponse: Codable, Sendable {
     public let trialID: String
-    public let trialToken: String?
+    public let trialToken: String
     public let status: String
     public let expiresAt: FlexibleDate
     public let features: [String]

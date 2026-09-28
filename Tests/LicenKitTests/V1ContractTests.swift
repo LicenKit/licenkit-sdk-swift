@@ -4,13 +4,30 @@ import XCTest
 
 final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
     private let lock = NSLock()
+    private var activationVerifications: [String: StoredActivationVerification] = [:]
     private var licenses: [String: StoredCredentials] = [:]
+    private var trialVerifications: [String: StoredTrialVerification] = [:]
     private var trials: [String: StoredTrialCredentials] = [:]
     private var snapshots: [String: StoredEntitlementSnapshot] = [:]
     private var shouldFailNextLicenseSave = false
+    private var shouldFailNextTrialSave = false
 
     func failNextLicenseSave() {
         lock.withLock { shouldFailNextLicenseSave = true }
+    }
+
+    func failNextTrialSave() {
+        lock.withLock { shouldFailNextTrialSave = true }
+    }
+
+    func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification? {
+        lock.withLock { activationVerifications[fingerprint] }
+    }
+    func saveActivationVerification(_ verification: StoredActivationVerification, for fingerprint: String) throws {
+        lock.withLock { activationVerifications[fingerprint] = verification }
+    }
+    func clearActivationVerification(for fingerprint: String) throws {
+        _ = lock.withLock { activationVerifications.removeValue(forKey: fingerprint) }
     }
 
     func loadCredentials(for fingerprint: String) throws -> StoredCredentials? {
@@ -33,10 +50,26 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
         lock.withLock { trials[fingerprint] }
     }
     func saveTrialCredentials(_ credentials: StoredTrialCredentials, for fingerprint: String) throws {
+        let shouldFail = lock.withLock {
+            defer { shouldFailNextTrialSave = false }
+            return shouldFailNextTrialSave
+        }
+        if shouldFail {
+            throw LicenKitError.credentialStorageError(operation: "write", status: -1)
+        }
         lock.withLock { trials[fingerprint] = credentials }
     }
     func clearTrialCredentials(for fingerprint: String) throws {
         _ = lock.withLock { trials.removeValue(forKey: fingerprint) }
+    }
+    func loadTrialVerification(for fingerprint: String) throws -> StoredTrialVerification? {
+        lock.withLock { trialVerifications[fingerprint] }
+    }
+    func saveTrialVerification(_ verification: StoredTrialVerification, for fingerprint: String) throws {
+        lock.withLock { trialVerifications[fingerprint] = verification }
+    }
+    func clearTrialVerification(for fingerprint: String) throws {
+        _ = lock.withLock { trialVerifications.removeValue(forKey: fingerprint) }
     }
     func loadSnapshot(for fingerprint: String) throws -> StoredEntitlementSnapshot? {
         lock.withLock { snapshots[fingerprint] }
@@ -283,12 +316,7 @@ final class V1ContractTests: XCTestCase {
         }
     }
 
-    func testIntervalNormalizationAndCooldownDoNotRequest() async throws {
-        XCTAssertEqual(LicenKit.normalizeInterval(nil), 3_600)
-        XCTAssertEqual(LicenKit.normalizeInterval(12), 3_600)
-        XCTAssertEqual(LicenKit.normalizeInterval(4_000), 4_000)
-        XCTAssertEqual(LicenKit.normalizeInterval(99_999), 86_400)
-
+    func testValidationCooldownDoesNotRequestBeforeConfiguredInterval() async throws {
         let store = MemoryCredentialStore()
         try store.saveCredentials(opaqueCredentials(), for: fingerprint)
         let snapshot = licenseSnapshot(
@@ -344,6 +372,28 @@ final class V1ContractTests: XCTestCase {
             return XCTFail("Passing 30 seconds alone must not bypass the configured interval")
         }
         XCTAssertEqual(requests.get(), 0)
+    }
+
+    func testValidationIntervalRejectsLegacyNullAndOutOfRangeValues() async {
+        let state: [String: Any] = [
+            "kind": "activation_required",
+            "trial": [
+                "status": "unavailable",
+                "reason": "not_enabled",
+                "code": "TRIAL_NOT_ENABLED"
+            ]
+        ]
+        for interval: Any in [NSNull(), 3_599, 86_401] {
+            setJSONResponse(data: validateData(state: state, interval: interval))
+            guard case .failure(
+                .transportError(.invalidResponse(let statusCode, _), _),
+                _,
+                _
+            ) = await makeClient(store: MemoryCredentialStore()).validate(),
+            statusCode == 200 else {
+                return XCTFail("Expected strict validation interval rejection")
+            }
+        }
     }
 
     func testConcurrentValidateSharesOneServerRequestAndResult() async throws {
@@ -445,6 +495,10 @@ final class V1ContractTests: XCTestCase {
     func testActivationUsesServerTimeButFirstValidateStillRequests() async throws {
         let store = MemoryCredentialStore()
         try store.saveTrialCredentials(.init(trialID: "trl_old", trialToken: "ttk_old"), for: fingerprint)
+        try store.saveActivationVerification(
+            .init(machineToken: "mtk_secret"),
+            for: fingerprint
+        )
         setJSONResponse(data: activationData())
         let client = makeClient(store: store)
         let activation = await client.activate(licenseKey: "LK")
@@ -462,9 +516,105 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(requests.get(), 1)
     }
 
+    func testActivationRepeatsCredentialIssuanceWithSameVerificationTokenAfterCredentialWriteFailure() async throws {
+        let store = MemoryCredentialStore()
+        store.failNextLicenseSave()
+        let tokens = LockedBox<[String]>([])
+        setHandler { request in
+            let token = try XCTUnwrap(self.requestJSON(request)["machine_token"] as? String)
+            tokens.mutate { $0.append(token) }
+            return self.response(data: self.activationData(
+                activationID: "act_reissued",
+                machineToken: token
+            ))
+        }
+
+        guard case .failure(.credentialStorageError, _, _) = await makeClient(store: store).activate(licenseKey: "LK") else {
+            return XCTFail("Expected the first final credential write to fail")
+        }
+        let verification = try XCTUnwrap(store.loadActivationVerification(for: fingerprint))
+        guard case .success(let repeated, _) = await makeClient(store: store).activate(licenseKey: "LK") else {
+            return XCTFail("Expected retry to receive the existing Activation credentials")
+        }
+        XCTAssertEqual(repeated.activationID, "act_reissued")
+        XCTAssertEqual(tokens.get(), [verification.machineToken, verification.machineToken])
+        XCTAssertNil(try store.loadActivationVerification(for: fingerprint))
+        XCTAssertEqual(try store.loadCredentials(for: fingerprint)?.machineToken, verification.machineToken)
+    }
+
+    func testActivationRetryAfterLostResponseAndProcessRestartReusesVerificationToken() async throws {
+        let store = MemoryCredentialStore()
+        let sentToken = LockedBox<String?>(nil)
+        setHandler { request in
+            sentToken.set(try XCTUnwrap(self.requestJSON(request)["machine_token"] as? String))
+            throw URLError(.networkConnectionLost)
+        }
+        guard case .failure(.transportError, _, _) = await makeClient(store: store).activate(licenseKey: "LK") else {
+            return XCTFail("Expected the original response to be lost")
+        }
+        let verification = try XCTUnwrap(store.loadActivationVerification(for: fingerprint))
+        XCTAssertEqual(verification.machineToken, sentToken.get())
+
+        setHandler { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/activate") == true)
+            let token = try XCTUnwrap(self.requestJSON(request)["machine_token"] as? String)
+            XCTAssertEqual(token, verification.machineToken)
+            return self.response(data: self.activationData(
+                activationID: "act_reissued",
+                machineToken: token
+            ))
+        }
+        guard case .success(let activation, _) = await makeClient(store: store).activate(licenseKey: "LK"),
+              case .license(.active) = activation.snapshot.state else {
+            return XCTFail("Expected activate() retry to receive the existing Activation credentials")
+        }
+        XCTAssertEqual(try store.loadCredentials(for: fingerprint)?.activationID, "act_reissued")
+        XCTAssertNil(try store.loadActivationVerification(for: fingerprint))
+    }
+
+    func testValidateDoesNotExecuteActivationOrTrialVerificationActions() async throws {
+        let responseState: [String: Any] = [
+            "kind": "activation_required",
+            "trial": [
+                "status": "unavailable", "reason": "not_enabled",
+                "code": "TRIAL_NOT_ENABLED"
+            ]
+        ]
+
+        let activationStore = MemoryCredentialStore()
+        try activationStore.saveActivationVerification(
+            .init(machineToken: "mtk_verification"),
+            for: fingerprint
+        )
+        setHandler { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/validate") == true)
+            let credential = try XCTUnwrap(self.requestJSON(request)["credential"] as? [String: Any])
+            XCTAssertEqual(credential["kind"] as? String, "none")
+            return self.response(data: self.validateData(state: responseState))
+        }
+        guard case .success = await makeClient(store: activationStore).validate() else {
+            return XCTFail("Expected validation without executing Activation")
+        }
+        XCTAssertNotNil(try activationStore.loadActivationVerification(for: fingerprint))
+
+        let trialStore = MemoryCredentialStore()
+        try trialStore.saveTrialVerification(.init(trialToken: "ttk_verification"), for: fingerprint)
+        setHandler { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/validate") == true)
+            let credential = try XCTUnwrap(self.requestJSON(request)["credential"] as? [String: Any])
+            XCTAssertEqual(credential["kind"] as? String, "none")
+            return self.response(data: self.validateData(state: responseState))
+        }
+        guard case .success = await makeClient(store: trialStore).validate() else {
+            return XCTFail("Expected validation without executing Trial claim")
+        }
+        XCTAssertNotNil(try trialStore.loadTrialVerification(for: fingerprint))
+    }
+
     func testStartTrialUsesServerTimeAndPersistsTrialCredential() async throws {
         let store = MemoryCredentialStore()
         let expiresAt = validatedAt.addingTimeInterval(86_400)
+        try store.saveTrialVerification(.init(trialToken: "ttk_once"), for: fingerprint)
         setJSONResponse(data: [
             "trial_id": "trl_1",
             "trial_token": "ttk_once",
@@ -476,7 +626,8 @@ final class V1ContractTests: XCTestCase {
                 "features": ["trial_export"]
             ],
             "validation": [
-                "validation_interval_seconds": NSNull(),
+                "validation_interval_seconds": 3_600,
+                "offline_grace_seconds": NSNull(),
                 "validated_at": iso(validatedAt)
             ],
             "meta": ["request_id": "req_trial"]
@@ -508,8 +659,80 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(requests.get(), 1)
     }
 
-    func testServerIntervalIsPreservedAndClamped() async throws {
-        for (received, expected) in [(12.0, 3_600.0), (99_999.0, 86_400.0)] {
+    func testTrialRepeatsCredentialIssuanceWithSameVerificationTokenAfterCredentialWriteFailure() async throws {
+        let store = MemoryCredentialStore()
+        store.failNextTrialSave()
+        let tokens = LockedBox<[String]>([])
+        setHandler { request in
+            let token = try XCTUnwrap(self.requestJSON(request)["trial_token"] as? String)
+            tokens.mutate { $0.append(token) }
+            return self.response(data: self.trialClaimData(token: token))
+        }
+
+        guard case .failure(.credentialStorageError, _, _) = await makeClient(store: store).startTrial() else {
+            return XCTFail("Expected the first final Trial credential write to fail")
+        }
+        let verification = try XCTUnwrap(store.loadTrialVerification(for: fingerprint))
+        guard case .success(let snapshot, _) = await makeClient(store: store).startTrial(),
+              case .trial(.active) = snapshot.state else {
+            return XCTFail("Expected retry to receive the existing Trial credentials")
+        }
+        XCTAssertEqual(tokens.get(), [verification.trialToken, verification.trialToken])
+        XCTAssertEqual(try store.loadTrialCredentials(for: fingerprint)?.trialID, "trl_reissued")
+        XCTAssertNil(try store.loadTrialVerification(for: fingerprint))
+    }
+
+    func testTrialRetryAfterLostResponseAndProcessRestartReusesVerificationToken() async throws {
+        let store = MemoryCredentialStore()
+        let sentToken = LockedBox<String?>(nil)
+        setHandler { request in
+            sentToken.set(try XCTUnwrap(self.requestJSON(request)["trial_token"] as? String))
+            throw URLError(.networkConnectionLost)
+        }
+        guard case .failure(.transportError, _, _) = await makeClient(store: store).startTrial() else {
+            return XCTFail("Expected the original Trial response to be lost")
+        }
+        let verification = try XCTUnwrap(store.loadTrialVerification(for: fingerprint))
+        XCTAssertEqual(verification.trialToken, sentToken.get())
+
+        setHandler { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/trials/claim") == true)
+            let token = try XCTUnwrap(self.requestJSON(request)["trial_token"] as? String)
+            XCTAssertEqual(token, verification.trialToken)
+            return self.response(data: self.trialClaimData(
+                trialID: "trl_reissued",
+                token: token
+            ))
+        }
+        guard case .success(let snapshot, _) = await makeClient(store: store).startTrial(),
+              case .trial(.active) = snapshot.state else {
+            return XCTFail("Expected startTrial() retry to receive the existing Trial credentials")
+        }
+        XCTAssertEqual(try store.loadTrialCredentials(for: fingerprint)?.trialID, "trl_reissued")
+        XCTAssertNil(try store.loadTrialVerification(for: fingerprint))
+    }
+
+    func testOfflineGraceExceededRemainsUsableForOpaqueAndSignedLicenses() {
+        let grace: TimeInterval = 2_592_000
+        let graceExceededAt = validatedAt.addingTimeInterval(grace + 1)
+        for signedCredentialValid in [nil, true] as [Bool?] {
+            let snapshot = licenseSnapshot(
+                validatedAt: validatedAt,
+                interval: 3_600,
+                offlineGracePeriod: grace,
+                signedCredentialValid: signedCredentialValid
+            )
+            XCTAssertEqual(
+                snapshot.freshness(at: graceExceededAt),
+                .offlineGraceExceeded(since: validatedAt.addingTimeInterval(grace))
+            )
+            XCTAssertTrue(snapshot.isUsable(at: graceExceededAt))
+            XCTAssertTrue(snapshot.hasFeature("export", at: graceExceededAt))
+        }
+    }
+
+    func testServerIntervalIsPreservedWithinContractRange() async throws {
+        for received in [3_600.0, 86_400.0] {
             setJSONResponse(data: validateData(
                 state: [
                     "kind": "activation_required",
@@ -525,9 +748,9 @@ final class V1ContractTests: XCTestCase {
                 return XCTFail("Expected interval response")
             }
             XCTAssertEqual(snapshot.receivedValidationInterval, received)
-            XCTAssertEqual(snapshot.effectiveValidationInterval, expected)
+            XCTAssertEqual(snapshot.effectiveValidationInterval, received)
             XCTAssertEqual(metadata.receivedValidationInterval, received)
-            XCTAssertEqual(metadata.effectiveValidationInterval, expected)
+            XCTAssertEqual(metadata.effectiveValidationInterval, received)
         }
     }
 
@@ -564,7 +787,6 @@ final class V1ContractTests: XCTestCase {
         data["credential_update"] = [
             "credential_mode": "signed",
             "signed_license_token": "invalid",
-            "signed_license_token_expires_at": iso(validatedAt.addingTimeInterval(7_200)),
             "signing_key_id": "key_1"
         ]
         setJSONResponse(data: data)
@@ -599,11 +821,10 @@ final class V1ContractTests: XCTestCase {
 
     func testValidSignedCredentialStillRequiresConfiguredInterval() async throws {
         let key = Curve25519.Signing.PrivateKey()
-        let expiry = validatedAt.addingTimeInterval(7_200)
-        let token = try makeToken(privateKey: key, tokenExpiry: expiry)
+        let token = try makeToken(privateKey: key)
         let store = MemoryCredentialStore()
         try store.saveCredentials(
-            signedCredentials(token: token, expiry: expiry),
+            signedCredentials(token: token),
             for: fingerprint
         )
         try store.saveSnapshot(
@@ -611,7 +832,6 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: validatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
-                signedTokenExpiresAt: expiry,
                 signedCredentialValid: true
             )),
             for: fingerprint
@@ -635,30 +855,28 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(requests.get(), 0)
     }
 
-    func testExpiredSignedCredentialBypassesConfiguredIntervalButNotThirtySeconds() async throws {
+    func testSignedCredentialHasNoIndependentExpiry() async throws {
         let key = Curve25519.Signing.PrivateKey()
-        let expiry = validatedAt.addingTimeInterval(10)
-        let token = try makeToken(privateKey: key, tokenExpiry: expiry)
+        let token = try makeToken(privateKey: key)
         let store = MemoryCredentialStore()
         try store.saveCredentials(
-            signedCredentials(token: token, expiry: expiry),
+            signedCredentials(token: token),
             for: fingerprint
         )
         try store.saveSnapshot(
             .init(subject: .license, snapshot: licenseSnapshot(
                 validatedAt: validatedAt,
-                interval: 3_600,
+                interval: 86_400,
                 lastValidateResponseAt: validatedAt,
-                signedTokenExpiresAt: expiry,
                 signedCredentialValid: true
             )),
             for: fingerprint
         )
-        let clock = MutableClock(validatedAt.addingTimeInterval(20))
+        let clock = MutableClock(validatedAt.addingTimeInterval(7_200))
         let requests = LockedBox(0)
         setHandler { _ in
             requests.mutate { $0 += 1 }
-            throw URLError(.notConnectedToInternet)
+            return self.response(data: self.validateData(state: self.licenseState()))
         }
         let client = makeClient(
             store: store,
@@ -666,32 +884,20 @@ final class V1ContractTests: XCTestCase {
             signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
         )
         guard case .notPerformed(.cooldown, let cached, _) = await client.validate() else {
-            return XCTFail("Expired Signed credentials must still obey the 30-second throttle")
+            return XCTFail("Signed credentials must not acquire an independent expiry")
         }
-        XCTAssertEqual(cached?.source, .local)
-        XCTAssertEqual(cached?.signedCredentialValid, false)
+        XCTAssertEqual(cached?.source, .signedLocal)
+        XCTAssertEqual(cached?.signedCredentialValid, true)
         XCTAssertEqual(requests.get(), 0)
-
-        clock.set(validatedAt.addingTimeInterval(31))
-        guard case .failure = await client.validate() else {
-            return XCTFail("Expired Signed credentials may request after 30 seconds")
-        }
-        XCTAssertEqual(requests.get(), 1)
-        XCTAssertEqual(
-            try store.loadSnapshot(for: fingerprint)?.snapshot.lastValidateResponseAt,
-            validatedAt,
-            "A network failure without an HTTP response must not advance the throttle"
-        )
     }
 
     func testInvalidSignedCredentialBypassesConfiguredIntervalButNotThirtySeconds() async throws {
         let signingKey = Curve25519.Signing.PrivateKey()
         let unrelatedKey = Curve25519.Signing.PrivateKey()
-        let expiry = validatedAt.addingTimeInterval(7_200)
-        let token = try makeToken(privateKey: signingKey, tokenExpiry: expiry)
+        let token = try makeToken(privateKey: signingKey)
         let store = MemoryCredentialStore()
         try store.saveCredentials(
-            signedCredentials(token: token, expiry: expiry),
+            signedCredentials(token: token),
             for: fingerprint
         )
         try store.saveSnapshot(
@@ -699,7 +905,6 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: validatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
-                signedTokenExpiresAt: expiry,
                 signedCredentialValid: true
             )),
             for: fingerprint
@@ -730,11 +935,10 @@ final class V1ContractTests: XCTestCase {
 
     func testHTTP401StartsFullConfiguredCooldownForValidSignedCredential() async throws {
         let key = Curve25519.Signing.PrivateKey()
-        let expiry = validatedAt.addingTimeInterval(10_000)
-        let token = try makeToken(privateKey: key, tokenExpiry: expiry)
+        let token = try makeToken(privateKey: key)
         let store = MemoryCredentialStore()
         try store.saveCredentials(
-            signedCredentials(token: token, expiry: expiry),
+            signedCredentials(token: token),
             for: fingerprint
         )
         try store.saveSnapshot(
@@ -742,7 +946,6 @@ final class V1ContractTests: XCTestCase {
                 validatedAt: validatedAt,
                 interval: 3_600,
                 lastValidateResponseAt: validatedAt,
-                signedTokenExpiresAt: expiry,
                 signedCredentialValid: true
             )),
             for: fingerprint
@@ -778,29 +981,37 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(requests.get(), 0)
     }
 
-    func testSignedOuterExpiryAndStateMustMatchVerifiedClaims() async throws {
+    func testSignedTokenRejectsLegacyExpAndStateMustMatchVerifiedClaims() async throws {
         let key = Curve25519.Signing.PrivateKey()
         let signingPublicKey = key.publicKey.rawRepresentation.base64EncodedString()
         let exp = validatedAt.addingTimeInterval(7_200)
-        let token = try makeToken(privateKey: key, tokenExpiry: exp, features: ["export"])
-        var mismatchedExpiry = activationData(
-            mode: "signed", token: token, keyID: "key_1", tokenExpiry: exp.addingTimeInterval(1)
+        let legacyToken = try makeToken(
+            privateKey: key,
+            features: ["export"],
+            legacyExpirationClaim: exp
         )
-        setJSONResponse(data: mismatchedExpiry)
         let store = MemoryCredentialStore()
+        try store.saveActivationVerification(
+            .init(machineToken: "mtk_secret"),
+            for: fingerprint
+        )
+        setJSONResponse(data: activationData(
+            mode: "signed", token: legacyToken, keyID: "key_1"
+        ))
         let first = await makeClient(store: store, signingPublicKey: signingPublicKey).activate(licenseKey: "LK")
-        guard case .failure(.protocolError(let reason), _, let metadata) = first else {
-            return XCTFail("Expected signed exp mismatch failure")
+        guard case .failure(.invalidSignedLicenseToken(let reason), _, let metadata) = first else {
+            return XCTFail("Expected legacy exp rejection")
         }
-        XCTAssertTrue(reason.contains("exp claim"))
+        XCTAssertTrue(reason.contains("unsupported claims"))
         XCTAssertEqual(metadata.requestID, "req_1")
         XCTAssertNil(try store.loadCredentials(for: fingerprint))
 
-        mismatchedExpiry = activationData(
-            mode: "signed", token: token, keyID: "key_1", tokenExpiry: exp,
+        let token = try makeToken(privateKey: key, features: ["export"])
+        let mismatchedState = activationData(
+            mode: "signed", token: token, keyID: "key_1",
             stateFeatures: ["different"]
         )
-        setJSONResponse(data: mismatchedExpiry)
+        setJSONResponse(data: mismatchedState)
         let second = await makeClient(store: store, signingPublicKey: signingPublicKey).activate(licenseKey: "LK")
         guard case .failure(.protocolError(let reason), _, _) = second else {
             return XCTFail("Expected signed state mismatch failure")
@@ -814,7 +1025,6 @@ final class V1ContractTests: XCTestCase {
         let verifier = Ed25519Verifier()
         let legacy = try makeToken(
             privateKey: key,
-            tokenExpiry: validatedAt.addingTimeInterval(7_200),
             legacyAccountClaim: true
         )
         XCTAssertThrowsError(try verifier.verifyAndDecodeToken(
@@ -827,7 +1037,6 @@ final class V1ContractTests: XCTestCase {
             productID: "prd_other", releaseVersion: "2.4.0",
             releasePlatform: "macos", releaseArch: "arm64",
             fingerprint: fingerprint, issuedAtTimestamp: Int64(validatedAt.timeIntervalSince1970),
-            tokenExpiresAtTimestamp: Int64(validatedAt.addingTimeInterval(7_200).timeIntervalSince1970),
             licenseExpiresAtTimestamp: nil, updatesUntilTimestamp: nil, features: ["export"]
         )
         XCTAssertThrowsError(try ClaimsEvaluator().evaluate(
@@ -1056,6 +1265,10 @@ final class V1ContractTests: XCTestCase {
     func testStateWritesSerializeValidateThenActivate() async throws {
         let store = MemoryCredentialStore()
         try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        try store.saveActivationVerification(
+            .init(machineToken: "mtk_new"),
+            for: fingerprint
+        )
         let validationStarted = expectation(description: "validation started")
         let releaseValidation = DispatchSemaphore(value: 0)
         setHandler { request in
@@ -1076,38 +1289,15 @@ final class V1ContractTests: XCTestCase {
         XCTAssertEqual(try store.loadCredentials(for: fingerprint)?.activationID, "act_new")
     }
 
-    func testOldStoredCredentialJSONStillDecodes() throws {
+    func testIncompleteStoredCredentialJSONIsRejected() throws {
         let old = """
-        {"activationID":"act_1","machineToken":"mtk","credentialMode":"opaque",\
+        {"activationID":"act_1","machineToken":"mtk",\
         "signedLicenseToken":null,"signingKeyID":null,"lastValidatedAt":0,\
         "cachedTerms":{"max_activations":1,"features":["export"]}}
         """
-        let decoded = try JSONDecoder().decode(StoredCredentials.self, from: Data(old.utf8))
-        XCTAssertEqual(decoded.activationID, "act_1")
-        XCTAssertNil(decoded.signedLicenseTokenExpiresAt)
-
-        let oldTrial = """
-        {"trialID":"trl_1","trialToken":"ttk","expiresAt":0,"features":["export"],"lastValidatedAt":0}
-        """
-        XCTAssertEqual(
-            try JSONDecoder().decode(StoredTrialCredentials.self, from: Data(oldTrial.utf8)).trialID,
-            "trl_1"
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(StoredCredentials.self, from: Data(old.utf8))
         )
-
-        let encodedSnapshot = try JSONEncoder().encode(
-            licenseSnapshot(validatedAt: validatedAt, interval: 3_600)
-        )
-        var legacySnapshot = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: encodedSnapshot) as? [String: Any]
-        )
-        legacySnapshot.removeValue(forKey: "lastValidateResponseAt")
-        legacySnapshot.removeValue(forKey: "signedCredentialValid")
-        let migratedSnapshot = try JSONDecoder().decode(
-            EntitlementSnapshot.self,
-            from: JSONSerialization.data(withJSONObject: legacySnapshot)
-        )
-        XCTAssertNil(migratedSnapshot.lastValidateResponseAt)
-        XCTAssertNil(migratedSnapshot.signedCredentialValid)
     }
 
     private func makeClient(
@@ -1146,19 +1336,17 @@ final class V1ContractTests: XCTestCase {
             machineToken: machineToken,
             credentialMode: .opaque,
             signedLicenseToken: nil,
-            signingKeyID: nil,
-            signedLicenseTokenExpiresAt: nil
+            signingKeyID: nil
         )
     }
 
-    private func signedCredentials(token: String, expiry: Date) -> StoredCredentials {
+    private func signedCredentials(token: String) -> StoredCredentials {
         StoredCredentials(
             activationID: "act_1",
             machineToken: "mtk_secret",
             credentialMode: .signed,
             signedLicenseToken: token,
-            signingKeyID: "key_1",
-            signedLicenseTokenExpiresAt: expiry
+            signingKeyID: "key_1"
         )
     }
 
@@ -1166,7 +1354,7 @@ final class V1ContractTests: XCTestCase {
         validatedAt: Date,
         interval: TimeInterval,
         lastValidateResponseAt: Date? = nil,
-        signedTokenExpiresAt: Date? = nil,
+        offlineGracePeriod: TimeInterval? = 2_592_000,
         signedCredentialValid: Bool? = nil
     ) -> EntitlementSnapshot {
         EntitlementSnapshot(
@@ -1178,7 +1366,7 @@ final class V1ContractTests: XCTestCase {
             validatedAt: validatedAt,
             receivedValidationInterval: interval,
             effectiveValidationInterval: interval,
-            signedLicenseTokenExpiresAt: signedTokenExpiresAt,
+            offlineGracePeriod: offlineGracePeriod,
             lastValidateResponseAt: lastValidateResponseAt,
             signedCredentialValid: signedCredentialValid
         )
@@ -1193,13 +1381,15 @@ final class V1ContractTests: XCTestCase {
 
     private func validateData(
         state: [String: Any],
-        interval: Any = NSNull(),
+        interval: Any = 3_600,
+        offlineGrace: Any = 2_592_000,
         requestID: String = "req_1"
     ) -> [String: Any] {
         var data: [String: Any] = [
             "state": state,
             "validation": [
                 "validation_interval_seconds": interval,
+                "offline_grace_seconds": offlineGrace,
                 "validated_at": iso(validatedAt)
             ],
             "meta": ["request_id": requestID]
@@ -1208,7 +1398,6 @@ final class V1ContractTests: XCTestCase {
             data["credential_update"] = [
                 "credential_mode": "opaque",
                 "signed_license_token": NSNull(),
-                "signed_license_token_expires_at": NSNull(),
                 "signing_key_id": NSNull()
             ]
         }
@@ -1221,7 +1410,6 @@ final class V1ContractTests: XCTestCase {
         mode: String = "opaque",
         token: String? = nil,
         keyID: String? = nil,
-        tokenExpiry: Date? = nil,
         stateFeatures: [String] = ["export"]
     ) -> [String: Any] {
         var result: [String: Any] = [
@@ -1229,23 +1417,49 @@ final class V1ContractTests: XCTestCase {
             "machine_token": machineToken,
             "credential_mode": mode,
             "signed_license_token": token ?? NSNull(),
-            "signed_license_token_expires_at": tokenExpiry.map(iso) ?? NSNull(),
             "signing_key_id": keyID ?? NSNull(),
             "license_expires_at": NSNull(),
             "terms": ["max_activations": 1, "features": stateFeatures, "updates_until": NSNull()],
             "state": licenseState(features: stateFeatures),
             "validation": [
-                "validation_interval_seconds": NSNull(),
+                "validation_interval_seconds": 3_600,
+                "offline_grace_seconds": 2_592_000,
                 "validated_at": iso(validatedAt)
             ],
             "meta": ["request_id": "req_1"]
         ]
         if mode == "opaque" {
             result["signed_license_token"] = NSNull()
-            result["signed_license_token_expires_at"] = NSNull()
             result["signing_key_id"] = NSNull()
         }
         return result
+    }
+
+    private func trialClaimData(
+        trialID: String = "trl_reissued",
+        token: String,
+        status: String = "active"
+    ) -> [String: Any] {
+        let expiresAt = validatedAt.addingTimeInterval(86_400)
+        return [
+            "trial_id": trialID,
+            "trial_token": token,
+            "status": status,
+            "expires_at": iso(expiresAt),
+            "features": ["trial_export"],
+            "state": [
+                "kind": "trial",
+                "status": status,
+                "expires_at": iso(expiresAt),
+                "features": ["trial_export"]
+            ],
+            "validation": [
+                "validation_interval_seconds": 3_600,
+                "offline_grace_seconds": NSNull(),
+                "validated_at": iso(validatedAt)
+            ],
+            "meta": ["request_id": "req_trial"]
+        ]
     }
 
     private func setJSONResponse(data: [String: Any], status: Int = 200) {
@@ -1313,19 +1527,22 @@ final class V1ContractTests: XCTestCase {
 
     private func makeToken(
         privateKey: Curve25519.Signing.PrivateKey,
-        tokenExpiry: Date,
         features: [String] = ["export"],
-        legacyAccountClaim: Bool = false
+        legacyAccountClaim: Bool = false,
+        legacyExpirationClaim: Date? = nil
     ) throws -> String {
         let header = SignedLicenseTokenHeader(kid: "key_1")
         var payload: [String: Any] = [
             "lic": "lic_1", "act": "act_1", "ins": "ins_1", "prd": "prd_1",
             "ver": "2.4.0", "plt": "macos", "arc": "arm64",
             "fp": fingerprint, "iat": Int64(validatedAt.timeIntervalSince1970),
-            "exp": Int64(tokenExpiry.timeIntervalSince1970), "lexp": NSNull(), "upd": NSNull(),
+            "lexp": NSNull(), "upd": NSNull(),
             "fea": features
         ]
         if legacyAccountClaim { payload["acc"] = "acc_legacy" }
+        if let legacyExpirationClaim {
+            payload["exp"] = Int64(legacyExpirationClaim.timeIntervalSince1970)
+        }
         let verifier = Ed25519Verifier()
         let headerPart = verifier.encodeBase64URL(try JSONEncoder().encode(header))
         let payloadPart = verifier.encodeBase64URL(

@@ -6,22 +6,35 @@ public struct StoredCredentials: Codable, Equatable, Sendable {
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
     public let signingKeyID: String?
-    public let signedLicenseTokenExpiresAt: Date?
 
     public init(
         activationID: String,
         machineToken: String,
         credentialMode: CredentialMode,
         signedLicenseToken: String?,
-        signingKeyID: String?,
-        signedLicenseTokenExpiresAt: Date?
+        signingKeyID: String?
     ) {
         self.activationID = activationID
         self.machineToken = machineToken
         self.credentialMode = credentialMode
         self.signedLicenseToken = signedLicenseToken
         self.signingKeyID = signingKeyID
-        self.signedLicenseTokenExpiresAt = signedLicenseTokenExpiresAt
+    }
+}
+
+public struct StoredActivationVerification: Codable, Equatable, Sendable {
+    public let machineToken: String
+
+    public init(machineToken: String) {
+        self.machineToken = machineToken
+    }
+}
+
+public struct StoredTrialVerification: Codable, Equatable, Sendable {
+    public let trialToken: String
+
+    public init(trialToken: String) {
+        self.trialToken = trialToken
     }
 }
 
@@ -52,12 +65,18 @@ public struct StoredEntitlementSnapshot: Codable, Equatable, Sendable {
 }
 
 public protocol CredentialStore: Sendable {
+    func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification?
+    func saveActivationVerification(_ verification: StoredActivationVerification, for fingerprint: String) throws
+    func clearActivationVerification(for fingerprint: String) throws
     func loadCredentials(for fingerprint: String) throws -> StoredCredentials?
     func saveCredentials(_ credentials: StoredCredentials, for fingerprint: String) throws
     func clearCredentials(for fingerprint: String) throws
     func loadTrialCredentials(for fingerprint: String) throws -> StoredTrialCredentials?
     func saveTrialCredentials(_ credentials: StoredTrialCredentials, for fingerprint: String) throws
     func clearTrialCredentials(for fingerprint: String) throws
+    func loadTrialVerification(for fingerprint: String) throws -> StoredTrialVerification?
+    func saveTrialVerification(_ verification: StoredTrialVerification, for fingerprint: String) throws
+    func clearTrialVerification(for fingerprint: String) throws
     func loadSnapshot(for fingerprint: String) throws -> StoredEntitlementSnapshot?
     func saveSnapshot(_ snapshot: StoredEntitlementSnapshot, for fingerprint: String) throws
 }

@@ -31,9 +31,6 @@ struct ClaimsEvaluator: Sendable {
         guard claims.issuedAt <= now.addingTimeInterval(300) else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token was issued in the future")
         }
-        guard claims.tokenExpiresAt > now else {
-            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token has expired")
-        }
         if let licenseExpiration = claims.licenseExpiresAt, licenseExpiration <= now {
             return .licenseExpired(expiresAt: licenseExpiration)
         }

@@ -45,7 +45,7 @@ public final class LicenKit: @unchecked Sendable {
 
 构建身份不再由业务代码传入。SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号，将操作系统标识为 `macos`，并根据主可执行文件架构单独推导 `arm64`、`x86_64` 或 `universal`；无法取得时返回 `.configurationError`。请求使用独立的 `release_version`、`release_platform` 与 `release_arch` 字段。请求超时固定为 SDK 内部的 15 秒，Keychain 使用当前 App 私有命名空间，不暴露 Access Group。
 
-`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动后应调用 `validate()` 完成恢复与必要的联网校验。
+`currentSnapshot` 是进程内最近加载或写入的状态；初始化不会同步读取 Keychain。App 启动后应调用 `validate()` 加载持久化状态并执行必要的联网校验。
 
 ## 操作结果
 
@@ -142,6 +142,8 @@ public enum StateSource: String, Codable, Equatable, Sendable {
 
 public enum EntitlementFreshness: Equatable, Sendable {
     case fresh(until: Date)
+    case offlineGrace(until: Date)
+    case offlineGraceExceeded(since: Date)
     case validationRequired(since: Date?)
     case unknown
 }
@@ -152,7 +154,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
     public let validatedAt: Date?
     public let receivedValidationInterval: TimeInterval?
     public let effectiveValidationInterval: TimeInterval?
-    public let signedLicenseTokenExpiresAt: Date?
+    public let offlineGracePeriod: TimeInterval?
     public let lastValidateResponseAt: Date?
     public let signedCredentialValid: Bool?
     public let businessCode: String?
@@ -164,9 +166,9 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
 }
 ```
 
-收到的在线校验间隔为 `nil` 时采用 3600 秒，并限制到 3600 至 86400 秒。活动授权的 `fresh(until:)` 不晚于业务到期、业务状态校验窗口或 Signed Token 到期中的任一时间。只有活动状态且仍 fresh 时，`isUsable` 才返回 `true`；`hasFeature` 还要求功能名存在于 Trial features 或 License terms 中。
+在线校验间隔由服务端必填，范围为 3600 至 86400 秒。间隔内为 `fresh`；间隔后、License 离线宽限期前为 `offlineGrace`；超过宽限期为 `offlineGraceExceeded`。新鲜度不决定可用性：活动状态在业务未到期且 Signed 凭据未被判定无效时，`isUsable` 仍返回 `true`；`hasFeature` 还要求功能名存在于 Trial features 或 License terms 中。
 
-请求冷却与业务新鲜度分开保存。`lastValidateResponseAt` 是两个门槛的共同起点；`signedCredentialValid` 为 `true/false` 时表示本地 Signed 凭据本轮验证成功/失败，非 Signed 或尚无结论时可以为空。`validate()` 的普通路径必须同时越过 Server 建议间隔和公开常量 `minimumValidationRequestInterval`（当前为 30 秒）；Signed Token 过期或本地验证失败时只绕过建议间隔。合法业务成功和明确 HTTP 失败会推进最近响应时间；无 HTTP 响应的传输失败与 2xx 非法业务数据不会推进。HTTP 失败不推进 `validatedAt`。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
+请求冷却与业务新鲜度分开保存。`lastValidateResponseAt` 是两个门槛的共同起点；`signedCredentialValid` 为 `true/false` 时表示本地 Signed 凭据本轮验证成功/失败，非 Signed 或尚无结论时可以为空。`validate()` 的普通路径必须同时越过 Product 在线复核间隔和公开常量 `minimumValidationRequestInterval`（当前为 30 秒）；Signed Token 本地验证失败时只绕过前者。合法业务成功和明确 HTTP 失败会推进最近响应时间；无 HTTP 响应的传输失败与 2xx 非法业务数据不会推进。HTTP 失败不推进 `validatedAt`。`activate()`、`startTrial()`、`deactivate()` 不受这些门槛约束，也不启动冷却。
 
 `businessCode` 与 `details` 保存业务终态的原始诊断信息；其中敏感字段按字段递归脱敏。
 
@@ -251,12 +253,11 @@ HTTP 5xx 归为传输错误，但保留响应中的安全 `code/requestID/detail
 Token 是紧凑 JWS：
 
 - Header 固定要求 `alg=EdDSA`、`typ=licenkit-license+jwt` 与已知 `kid`；
-- Claims 要求 `lic`、`act`、`ins`、`prd`、`ver`、`plt`、`arc`、`fp`、`iat`、`exp`、`lexp`、`upd`、`fea`；
+- Claims 要求 `lic`、`act`、`ins`、`prd`、`ver`、`plt`、`arc`、`fp`、`iat`、`lexp`、`upd`、`fea`；未知 Claim（包括旧 `exp`）按协议错误拒绝；
 - `prd/act/fp/ver/plt/arc` 必须与当前 Product、Activation、设备和 SDK 自动读取的构建身份一致；`ins` 由 Server 签发并保留为服务端租户信息，不要求宿主 App 再配置一份；
-- 响应外层 Signed Token 到期时间必须与签名内绝对 `exp` 相同；
 - Active License 的 features、`updates_until` 和最终到期时间必须与签名 Claims 相同；
 - `lexp` 可为空表示永久 License；`upd` 可为空表示不限制未来版本；
 - Token 不携带 Product Release ID 或 `released_at`；更新权益是否覆盖当前版本由 Server 在线校验，SDK 不用 `upd` 在本地重复推导发布时间规则；
 - Claims 不包含 Registration Key。
 
-Plan 的 `signed_token_ttl_seconds` 只用于 Server 计算绝对 `exp`：它取“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值；billing 模式的最终截止时间已包含支付宽限。原始 TTL 不进入 Token，也不要求覆盖 3600 秒建议间隔。Token 先到期时，后续 `validate()` 绕过建议间隔但仍受 30 秒门槛。SDK 不从 Token 自报算法选择验证器，也不把运行时下载的公钥自动提升为信任根。
+Product 的 `validation_interval_seconds` 控制在线复核尝试频率；Plan 的 `offline_grace_seconds` 在签发时固化到 License，超过后只产生 `offlineGraceExceeded` 强提示。两者都不是 Signed Token 独有规则，也都不会单独使授权不可用。SDK 不从 Token 自报算法选择验证器，也不把运行时下载的公钥自动提升为信任根。

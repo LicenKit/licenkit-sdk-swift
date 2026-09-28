@@ -50,21 +50,13 @@ SDK 分两层表达事实：
 
 ## 新鲜度模型
 
-服务端提供 `validated_at` 与可空的 `validation_interval_seconds`。客户端保留原始值，同时计算 3600 至 86400 秒范围内的生效间隔；空值使用 3600 秒。
+服务端提供 `validated_at`、Product 级必填 `validation_interval_seconds`，以及 License 级可空 `offline_grace_seconds`。在线复核间隔范围为 3600 至 86400 秒；离线宽限期来自签发 License 时固化的 Plan 配置。
 
-活动权益的可用截止时间为：
+`freshness(at:)` 在在线复核间隔内返回 `fresh`，之后到离线宽限期之间返回 `offlineGrace`，超过宽限期返回 `offlineGraceExceeded`。这些状态只表达在线证据的新鲜度和宿主提示强度。
 
-```text
-min(
-  validated_at + effective_validation_interval,
-  business_expires_at（若有）,
-  signed_token_exp（若有）
-)
-```
+`isUsable(at:)` 由 active 业务状态、Trial/License 业务到期和 Signed 凭据是否有效决定。超过在线复核间隔或离线宽限期仍可用；服务端返回的 License `expires_at` 已包含支付订阅的支付宽限，客户端不重复计算。
 
-只有当前时间早于该截止时间，且业务状态仍为 active，`isUsable(at:)` 才为真。服务端返回的 License `expires_at` 已包含支付订阅的宽限期；客户端不重复计算。
-
-业务新鲜度与请求冷却不是同一状态。`validatedAt` 来自合法业务响应；`lastValidateResponseAt` 表示最近一次取得明确 `/validate` Server 结果的本地时间。普通路径同时检查 `lastValidateResponseAt + effectiveInterval` 与 `lastValidateResponseAt + 30 seconds`。Signed Token 过期或本地验证失败时跳过前者，但仍检查后者。
+业务新鲜度与请求冷却不是同一状态。`validatedAt` 来自合法业务响应；`lastValidateResponseAt` 表示最近一次取得明确 `/validate` Server 结果的本地时间。普通路径同时检查 `lastValidateResponseAt + effectiveInterval` 与 `lastValidateResponseAt + 30 seconds`。Signed Token 本地验证失败时跳过前者，但仍检查后者。
 
 只有两类 `/validate` 结果会写 `lastValidateResponseAt`：合法的成功业务数据，以及具有明确 HTTP 状态的失败。DNS、TLS、超时、断网等没有 HTTP 响应的失败和 2xx 非法业务数据不写该时间；HTTP 失败也不写 `validatedAt` 或新业务快照。`activate()`、`startTrial()` 和 `deactivate()` 不读写请求冷却时间。
 
@@ -75,7 +67,7 @@ min(
 - `signedLocal`：复用近期快照前重新验证了本地 Signed Token。
 - `local`：纯本地构造、没有服务端确认，例如无 License 凭据时解绑。
 
-来源与可用性是两个维度。`source=server` 仍可能是已到期或已吊销；`source=cache` 仍须通过新鲜度；`source=local` 不能伪造 `validatedAt`。
+来源、新鲜度与可用性是三个维度。`source=server` 仍可能是已到期或已吊销；`source=cache` 可以处于 `offlineGraceExceeded` 但继续可用；`source=local` 不能伪造 `validatedAt`。
 
 ## 凭证信任模型
 
@@ -94,13 +86,16 @@ Signed 模式还检查：
 - Token 仍携带 Server 签发的 `ins`，旧 `acc` Claim 不接受；宿主 App 不再重复配置 Instance；
 - `prd/act/fp/ver/plt/arc` 与当前 Product、Activation、设备和自动读取的构建身份一致；
 - Token 不包含 Product Release ID 或发布时间；Release 发布时间只由 Server 在有限期更新权益校验中使用；
-- 外层 `signed_license_token_expires_at` 等于签名内 `exp`；
 - active License 的 features、更新期限与含支付宽限期的最终到期时间等于签名 Claims；
-- Token Payload 只包含绝对 `exp`，不包含 Plan 的 TTL 原值；`exp` 取“签发时间 + License 快照 TTL”与 License 最终有效截止时间（如有）中的较早值，TTL 可以短于 3600 秒建议间隔。
+- Token Payload 不包含 `exp`；业务到期由 `lexp` 表达，在线复核间隔和离线宽限期通过响应元数据表达。
 
 ## Trial 与无凭据状态
 
-Trial Claim 与 License 凭据分别存储。首次领取使用 `/trials/claim`；后续统一校验使用 `credential.kind=trial`。Trial Token 不参与 Ed25519 验签。正常 License 激活并保存后清除同设备 Trial 凭据。
+Trial Claim 与 License 凭据分别存储。客户端在首次请求前把自己生成的 Trial Token 持久化为验证中凭据；响应丢失或最终 Keychain 写入失败后，再次调用 `startTrial()` 使用同一 Token，服务端重复下发同一 Trial，不同 Token 不能只凭指纹取得既有凭据。后续统一校验使用 `credential.kind=trial`。Trial Token 不参与 Ed25519 验签。正常 License 激活并保存后清除同设备 Trial 凭据。
+
+Activation 验证中凭据只保存客户端生成的 Machine Token，不保存 Registration Key 明文或 Hash，也不保存设备名称。再次调用 `activate()` 时，SDK 复用该 Token，但使用用户本次输入的 Registration Key；由 Server 判断目标 License 并决定是首次创建还是重复下发既有 Activation。正式 License 凭据也不保存 Registration Key Hash。`validate()` 不执行激活或 Trial 领取。
+
+Machine Token 与 Trial Token 是 bearer credential：安全性来自 256 位 CSPRNG 随机性、TLS、Keychain 的 `ThisDeviceOnly` 本机存储、服务端只保存 Hash，以及资源范围与设备指纹的联合校验。这里承诺的是“另一设备只知道 Registration Key 或设备指纹时，不能取得既有凭据”。设备指纹不是密码学设备证明；如果攻击者已经从失陷客户端导出 Token，并能伪造该设备指纹，当前协议不能阻止重放。若产品威胁模型需要覆盖该场景，应另行引入设备私钥签名或平台证明，不能仅靠增加本地 Hash 判断来实现。
 
 没有本地凭据时，统一校验使用 `credential.kind=none`。对 active Product，它可以返回 Trial available、not enabled 或 already claimed；Product Release 是否登记不影响 Trial。Product 不存在/已归档和 Trial 配置损坏仍是失败，不伪装成 Trial 不可用。
 

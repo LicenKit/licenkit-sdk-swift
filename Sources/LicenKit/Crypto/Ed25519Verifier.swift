@@ -67,22 +67,19 @@ public struct Ed25519Verifier: Sendable {
             throw LicenKitError.invalidSignedLicenseToken(reason: "legacy tenant claim is not accepted")
         }
         let requiredClaims: Set<String> = [
-            "lic", "act", "ins", "prd", "ver", "plt", "arc", "fp", "iat", "exp", "lexp", "upd", "fea"
+            "lic", "act", "ins", "prd", "ver", "plt", "arc", "fp", "iat", "lexp", "upd", "fea"
         ]
         guard requiredClaims.isSubset(of: Set(payloadDictionary.keys)) else {
             let missing = requiredClaims.subtracting(Set(payloadDictionary.keys)).sorted().joined(separator: ",")
             throw LicenKitError.invalidSignedLicenseToken(reason: "required claims are missing: \(missing)")
         }
+        guard Set(payloadDictionary.keys) == requiredClaims else {
+            let unsupported = Set(payloadDictionary.keys).subtracting(requiredClaims).sorted().joined(separator: ",")
+            throw LicenKitError.invalidSignedLicenseToken(reason: "unsupported claims are present: \(unsupported)")
+        }
         let claims: LicenseClaims
         do { claims = try JSONDecoder().decode(LicenseClaims.self, from: payload) }
         catch { throw LicenKitError.invalidSignedLicenseToken(reason: "claims could not be decoded: \(error.localizedDescription)") }
-        guard claims.tokenExpiresAtTimestamp > claims.issuedAtTimestamp else {
-            throw LicenKitError.invalidSignedLicenseToken(reason: "exp must be later than iat")
-        }
-        if let licenseExpiration = claims.licenseExpiresAtTimestamp,
-           claims.tokenExpiresAtTimestamp > licenseExpiration {
-            throw LicenKitError.invalidSignedLicenseToken(reason: "exp cannot be later than lexp")
-        }
         return (header, claims)
     }
 

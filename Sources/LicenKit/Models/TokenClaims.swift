@@ -22,7 +22,6 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public let releaseArch: String
     public let fingerprint: String
     public let issuedAtTimestamp: Int64
-    public let tokenExpiresAtTimestamp: Int64
     public let licenseExpiresAtTimestamp: Int64?
     public let updatesUntilTimestamp: Int64?
     public let features: [String]
@@ -37,14 +36,12 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         case releaseArch = "arc"
         case fingerprint = "fp"
         case issuedAtTimestamp = "iat"
-        case tokenExpiresAtTimestamp = "exp"
         case licenseExpiresAtTimestamp = "lexp"
         case updatesUntilTimestamp = "upd"
         case features = "fea"
     }
 
     public var issuedAt: Date { Date(timeIntervalSince1970: TimeInterval(issuedAtTimestamp)) }
-    public var tokenExpiresAt: Date { Date(timeIntervalSince1970: TimeInterval(tokenExpiresAtTimestamp)) }
     public var licenseExpiresAt: Date? { licenseExpiresAtTimestamp.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
     public var updatesUntil: Date? { updatesUntilTimestamp.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
     public init(
@@ -57,7 +54,6 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         releaseArch: String,
         fingerprint: String,
         issuedAtTimestamp: Int64,
-        tokenExpiresAtTimestamp: Int64,
         licenseExpiresAtTimestamp: Int64?,
         updatesUntilTimestamp: Int64?,
         features: [String]
@@ -71,7 +67,6 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         self.releaseArch = releaseArch
         self.fingerprint = fingerprint
         self.issuedAtTimestamp = issuedAtTimestamp
-        self.tokenExpiresAtTimestamp = tokenExpiresAtTimestamp
         self.licenseExpiresAtTimestamp = licenseExpiresAtTimestamp
         self.updatesUntilTimestamp = updatesUntilTimestamp
         self.features = features

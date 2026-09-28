@@ -1,7 +1,9 @@
 import Foundation
+import Security
 
 public final class LicenKit: @unchecked Sendable {
     public static let minimumValidationRequestInterval: TimeInterval = 30
+    private static let defaultValidationInterval: TimeInterval = 3_600
     private static let lock = NSLock()
     nonisolated(unsafe) private static var instance: LicenKit?
 
@@ -102,29 +104,55 @@ public final class LicenKit: @unchecked Sendable {
         var requestStarted = false
         var responseRequestID: String?
         do {
+            let normalizedLicenseKey = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedLicenseKey.isEmpty else {
+                throw LicenKitError.protocolError(reason: "license key must not be empty")
+            }
             let build = try configuration.requireBuildIdentity()
             let fingerprint = try await fingerprintProvider.getFingerprint()
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 setCurrentSnapshot(stored.snapshot)
             }
+            let requestedMachineName = machineName ?? ProcessInfo.processInfo.hostName
+            let verification: StoredActivationVerification
+            if let existing = try credentialStore.loadActivationVerification(for: fingerprint) {
+                verification = existing
+            } else {
+                let storedCredentials = try credentialStore.loadCredentials(for: fingerprint)
+                verification = StoredActivationVerification(
+                    machineToken: try (
+                        storedCredentials?.machineToken
+                            ?? Self.generateVerificationToken(prefix: "mtk")
+                    )
+                )
+                try credentialStore.saveActivationVerification(verification, for: fingerprint)
+            }
             requestStarted = true
             let response = try await apiClient.activate(request: APIActivateRequest(
                 productID: configuration.productID,
-                licenseKey: licenseKey,
+                licenseKey: normalizedLicenseKey,
+                machineToken: verification.machineToken,
                 fingerprint: fingerprint,
                 devicePlatform: Self.devicePlatform,
-                name: machineName ?? ProcessInfo.processInfo.hostName,
+                name: requestedMachineName,
                 releaseVersion: build.version,
                 releasePlatform: build.platform,
                 releaseArch: build.arch
             ))
             responseRequestID = response.meta.requestID
+            guard response.machineToken == verification.machineToken else {
+                throw LicenKitError.protocolError(
+                    reason: "activation response returned a different machine_token"
+                )
+            }
 
-            let credentials = try credentials(from: response, fingerprint: fingerprint)
+            let credentials = try credentials(
+                from: response,
+                fingerprint: fingerprint
+            )
             let snapshot = try makeSnapshot(
                 state: response.state,
                 validation: response.validation,
-                signedTokenExpiresAt: credentials.signedLicenseTokenExpiresAt,
                 signedCredentialValid: credentials.credentialMode == .signed ? true : nil
             )
             try require(snapshot.state, isValidFor: .license)
@@ -138,6 +166,7 @@ public final class LicenKit: @unchecked Sendable {
             try credentialStore.saveCredentials(credentials, for: fingerprint)
             try credentialStore.clearTrialCredentials(for: fingerprint)
             try persist(snapshot: snapshot, subject: .license, fingerprint: fingerprint)
+            try credentialStore.clearActivationVerification(for: fingerprint)
             return .success(
                 value: ActivationData(
                     activationID: response.activationID,
@@ -171,42 +200,46 @@ public final class LicenKit: @unchecked Sendable {
                 lastKnown = stored.snapshot
                 setCurrentSnapshot(stored.snapshot)
             }
+            let verification: StoredTrialVerification
+            if let existing = try credentialStore.loadTrialVerification(for: fingerprint) {
+                verification = existing
+            } else {
+                let trialToken = try (
+                    credentialStore.loadTrialCredentials(for: fingerprint)?.trialToken
+                        ?? Self.generateVerificationToken(prefix: "ttk")
+                )
+                verification = StoredTrialVerification(trialToken: trialToken)
+                try credentialStore.saveTrialVerification(verification, for: fingerprint)
+            }
             requestStarted = true
             let response = try await apiClient.claimTrial(request: APITrialClaimRequest(
                 productID: configuration.productID,
                 fingerprint: fingerprint,
+                trialToken: verification.trialToken,
                 devicePlatform: Self.devicePlatform,
                 releaseVersion: build.version,
                 releasePlatform: build.platform,
                 releaseArch: build.arch
             ))
             responseRequestID = response.meta.requestID
-            guard response.status == "active",
-                  let token = response.trialToken, !token.isEmpty,
-                  let responseExpiresAt = response.expiresAt.date else {
+            guard response.trialToken == verification.trialToken,
+                  !response.trialToken.isEmpty else {
                 throw LicenKitError.protocolError(
-                    reason: "trial claim response did not contain a one-time active trial token"
+                    reason: "trial claim response returned a different trial_token"
                 )
             }
             let snapshot = try makeSnapshot(
                 state: response.state,
-                validation: response.validation,
-                signedTokenExpiresAt: nil
+                validation: response.validation
             )
-            guard case .trial(.active(let stateExpiresAt, let stateFeatures)) = snapshot.state else {
-                throw LicenKitError.protocolError(reason: "trial claim did not return trial.active")
-            }
-            guard datesEqual(responseExpiresAt, stateExpiresAt), response.features == stateFeatures else {
-                throw LicenKitError.protocolError(
-                    reason: "trial claim operation fields do not match the entitlement state"
-                )
-            }
+            try validateTrialClaimDuplicates(response, snapshot: snapshot)
 
             try credentialStore.saveTrialCredentials(
-                StoredTrialCredentials(trialID: response.trialID, trialToken: token),
+                StoredTrialCredentials(trialID: response.trialID, trialToken: response.trialToken),
                 for: fingerprint
             )
             try persist(snapshot: snapshot, subject: .trial, fingerprint: fingerprint)
+            try credentialStore.clearTrialVerification(for: fingerprint)
             return .success(
                 value: snapshot,
                 metadata: operationMetadata(snapshot: snapshot, requestID: response.meta.requestID)
@@ -302,7 +335,6 @@ public final class LicenKit: @unchecked Sendable {
             var snapshot = try makeSnapshot(
                 state: response.state,
                 validation: response.validation,
-                signedTokenExpiresAt: license?.signedLicenseTokenExpiresAt,
                 lastValidateResponseAt: responseReceivedAt,
                 signedCredentialValid: signedCredentialValid
             )
@@ -318,7 +350,6 @@ public final class LicenKit: @unchecked Sendable {
                 snapshot = try makeSnapshot(
                     state: response.state,
                     validation: response.validation,
-                    signedTokenExpiresAt: updatedLicense.signedLicenseTokenExpiresAt,
                     lastValidateResponseAt: responseReceivedAt,
                     signedCredentialValid: updatedLicense.credentialMode == .signed ? true : nil
                 )
@@ -342,6 +373,17 @@ public final class LicenKit: @unchecked Sendable {
                 confirmedResponseSubject = .some(.none)
             }
             try persist(snapshot: snapshot, subject: persistedSubject, fingerprint: fingerprint)
+            if persistedSubject == .license,
+               let license,
+               let verification = try credentialStore.loadActivationVerification(for: fingerprint),
+               verification.machineToken == license.machineToken {
+                try credentialStore.clearActivationVerification(for: fingerprint)
+            } else if persistedSubject == .trial,
+                      let trial,
+                      let verification = try credentialStore.loadTrialVerification(for: fingerprint),
+                      verification.trialToken == trial.trialToken {
+                try credentialStore.clearTrialVerification(for: fingerprint)
+            }
             return .success(
                 value: snapshot,
                 metadata: operationMetadata(snapshot: snapshot, requestID: response.meta.requestID)
@@ -469,8 +511,7 @@ public final class LicenKit: @unchecked Sendable {
             machineToken: response.machineToken,
             credentialMode: response.credentialMode,
             signedLicenseToken: response.signedLicenseToken,
-            signingKeyID: response.signingKeyID,
-            signedLicenseTokenExpiresAt: response.signedLicenseTokenExpiresAt?.date
+            signingKeyID: response.signingKeyID
         )
         try validateCredentialShape(credentials)
         if credentials.credentialMode == .signed {
@@ -493,8 +534,7 @@ public final class LicenKit: @unchecked Sendable {
             machineToken: current.machineToken,
             credentialMode: update.credentialMode,
             signedLicenseToken: update.signedLicenseToken,
-            signingKeyID: update.signingKeyID,
-            signedLicenseTokenExpiresAt: update.signedLicenseTokenExpiresAt?.date
+            signingKeyID: update.signingKeyID
         )
         try validateCredentialShape(updated)
         return updated
@@ -504,18 +544,16 @@ public final class LicenKit: @unchecked Sendable {
         switch credentials.credentialMode {
         case .opaque:
             guard credentials.signedLicenseToken == nil,
-                  credentials.signingKeyID == nil,
-                  credentials.signedLicenseTokenExpiresAt == nil else {
+                  credentials.signingKeyID == nil else {
                 throw LicenKitError.protocolError(
                     reason: "opaque credential unexpectedly contained Signed License Token fields"
                 )
             }
         case .signed:
             guard let token = credentials.signedLicenseToken, !token.isEmpty,
-                  let keyID = credentials.signingKeyID, !keyID.isEmpty,
-                  credentials.signedLicenseTokenExpiresAt != nil else {
+                  let keyID = credentials.signingKeyID, !keyID.isEmpty else {
                 throw LicenKitError.protocolError(
-                    reason: "signed credential is missing token, key ID, or token expiry"
+                    reason: "signed credential is missing token or key ID"
                 )
             }
         }
@@ -526,8 +564,7 @@ public final class LicenKit: @unchecked Sendable {
         fingerprint: String
     ) throws -> SignedLicenseEvaluation {
         guard let token = credentials.signedLicenseToken,
-              let responseKeyID = credentials.signingKeyID,
-              let responseExpiry = credentials.signedLicenseTokenExpiresAt else {
+              let responseKeyID = credentials.signingKeyID else {
             throw LicenKitError.protocolError(reason: "stored signed credential is incomplete")
         }
         let (header, claims) = try verifier.verifyAndDecodeToken(
@@ -537,11 +574,6 @@ public final class LicenKit: @unchecked Sendable {
         guard header.kid == responseKeyID else {
             throw LicenKitError.invalidSignedLicenseToken(
                 reason: "response signing_key_id does not match protected kid"
-            )
-        }
-        guard datesEqual(responseExpiry, claims.tokenExpiresAt) else {
-            throw LicenKitError.protocolError(
-                reason: "signed_license_token_expires_at does not match the signed exp claim"
             )
         }
         return try claimsEvaluator.evaluate(
@@ -627,7 +659,7 @@ public final class LicenKit: @unchecked Sendable {
         let elapsed = now().timeIntervalSince(lastResponseAt)
         let minimumElapsed = elapsed >= Self.minimumValidationRequestInterval
         let configuredInterval = snapshot.effectiveValidationInterval
-            ?? Self.normalizeInterval(nil)
+            ?? Self.defaultValidationInterval
         let configuredElapsed = elapsed >= configuredInterval
         let mayRequest = minimumElapsed && (bypassConfiguredInterval || configuredElapsed)
         return ValidationCooldownDecision(
@@ -639,14 +671,13 @@ public final class LicenKit: @unchecked Sendable {
     private func makeSnapshot(
         state apiState: APIEntitlementState,
         validation: APIValidationMetadata,
-        signedTokenExpiresAt: Date?,
         lastValidateResponseAt: Date? = nil,
         signedCredentialValid: Bool? = nil
     ) throws -> EntitlementSnapshot {
         guard let validatedAt = validation.validatedAt.date else {
             throw LicenKitError.protocolError(reason: "validation.validated_at must not be null")
         }
-        let effectiveInterval = Self.normalizeInterval(validation.validationIntervalSeconds)
+        let effectiveInterval = validation.validationIntervalSeconds
         let state = try mapState(apiState)
         return EntitlementSnapshot(
             state: state,
@@ -654,7 +685,7 @@ public final class LicenKit: @unchecked Sendable {
             validatedAt: validatedAt,
             receivedValidationInterval: validation.validationIntervalSeconds,
             effectiveValidationInterval: effectiveInterval,
-            signedLicenseTokenExpiresAt: signedTokenExpiresAt,
+            offlineGracePeriod: validation.offlineGraceSeconds,
             lastValidateResponseAt: lastValidateResponseAt,
             signedCredentialValid: signedCredentialValid,
             businessCode: apiState.code ?? apiState.trial?.code,
@@ -819,6 +850,37 @@ public final class LicenKit: @unchecked Sendable {
         }
     }
 
+    private func validateTrialClaimDuplicates(
+        _ response: APITrialClaimResponse,
+        snapshot: EntitlementSnapshot
+    ) throws {
+        switch snapshot.state {
+        case .trial(.active(let expiresAt, let features)):
+            guard response.status == "active",
+                  datesEqual(response.expiresAt.date, expiresAt),
+                  response.features == features else {
+                throw LicenKitError.protocolError(
+                    reason: "trial claim operation fields do not match trial.active"
+                )
+            }
+        case .trial(.expired(let expiresAt)):
+            guard response.status == "expired",
+                  datesEqual(response.expiresAt.date, expiresAt) else {
+                throw LicenKitError.protocolError(
+                    reason: "trial claim operation fields do not match trial.expired"
+                )
+            }
+        case .trial(.revoked):
+            guard response.status == "revoked" else {
+                throw LicenKitError.protocolError(
+                    reason: "trial claim operation fields do not match trial.revoked"
+                )
+            }
+        default:
+            throw LicenKitError.protocolError(reason: "trial claim did not return a Trial state")
+        }
+    }
+
     private func persist(
         snapshot: EntitlementSnapshot,
         subject: StoredCredentialSubject,
@@ -847,7 +909,7 @@ public final class LicenKit: @unchecked Sendable {
             source: .local,
             validatedAt: nil,
             receivedValidationInterval: nil,
-            effectiveValidationInterval: Self.normalizeInterval(nil),
+            effectiveValidationInterval: Self.defaultValidationInterval,
             lastValidateResponseAt: lastValidateResponseAt
         )
     }
@@ -884,6 +946,7 @@ public final class LicenKit: @unchecked Sendable {
             validatedAt: snapshot.validatedAt,
             receivedValidationInterval: snapshot.receivedValidationInterval,
             effectiveValidationInterval: snapshot.effectiveValidationInterval,
+            offlineGracePeriod: snapshot.offlineGracePeriod,
             lastValidateResponseAt: snapshot.lastValidateResponseAt
         )
     }
@@ -982,8 +1045,20 @@ public final class LicenKit: @unchecked Sendable {
         }
     }
 
-    static func normalizeInterval(_ received: TimeInterval?) -> TimeInterval {
-        min(max(received ?? 3_600, 3_600), 86_400)
+    private static func generateVerificationToken(prefix: String) throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw LicenKitError.credentialStorageError(
+                operation: "generate verification token",
+                status: status
+            )
+        }
+        let encoded = Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(prefix)_\(encoded)"
     }
 
     private static var devicePlatform: String {

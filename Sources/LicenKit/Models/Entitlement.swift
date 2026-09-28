@@ -18,6 +18,7 @@ public struct OperationMetadata: Equatable, Sendable {
     public let validatedAt: Date?
     public let receivedValidationInterval: TimeInterval?
     public let effectiveValidationInterval: TimeInterval?
+    public let offlineGracePeriod: TimeInterval?
     public let lastValidateResponseAt: Date?
 
     public init(
@@ -26,6 +27,7 @@ public struct OperationMetadata: Equatable, Sendable {
         validatedAt: Date? = nil,
         receivedValidationInterval: TimeInterval? = nil,
         effectiveValidationInterval: TimeInterval? = nil,
+        offlineGracePeriod: TimeInterval? = nil,
         lastValidateResponseAt: Date? = nil
     ) {
         self.source = source
@@ -33,6 +35,7 @@ public struct OperationMetadata: Equatable, Sendable {
         self.validatedAt = validatedAt
         self.receivedValidationInterval = receivedValidationInterval
         self.effectiveValidationInterval = effectiveValidationInterval
+        self.offlineGracePeriod = offlineGracePeriod
         self.lastValidateResponseAt = lastValidateResponseAt
     }
 }
@@ -87,6 +90,8 @@ public enum EntitlementState: Codable, Equatable, Sendable {
 
 public enum EntitlementFreshness: Equatable, Sendable {
     case fresh(until: Date)
+    case offlineGrace(until: Date)
+    case offlineGraceExceeded(since: Date)
     case validationRequired(since: Date?)
     case unknown
 }
@@ -97,7 +102,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
     public let validatedAt: Date?
     public let receivedValidationInterval: TimeInterval?
     public let effectiveValidationInterval: TimeInterval?
-    public let signedLicenseTokenExpiresAt: Date?
+    public let offlineGracePeriod: TimeInterval?
     public let lastValidateResponseAt: Date?
     public let signedCredentialValid: Bool?
     public let businessCode: String?
@@ -109,7 +114,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
         validatedAt: Date?,
         receivedValidationInterval: TimeInterval?,
         effectiveValidationInterval: TimeInterval?,
-        signedLicenseTokenExpiresAt: Date? = nil,
+        offlineGracePeriod: TimeInterval? = nil,
         lastValidateResponseAt: Date? = nil,
         signedCredentialValid: Bool? = nil,
         businessCode: String? = nil,
@@ -120,7 +125,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
         self.validatedAt = validatedAt
         self.receivedValidationInterval = receivedValidationInterval
         self.effectiveValidationInterval = effectiveValidationInterval
-        self.signedLicenseTokenExpiresAt = signedLicenseTokenExpiresAt
+        self.offlineGracePeriod = offlineGracePeriod
         self.lastValidateResponseAt = lastValidateResponseAt
         self.signedCredentialValid = signedCredentialValid
         self.businessCode = businessCode
@@ -131,19 +136,24 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
         guard let validatedAt, let effectiveValidationInterval else { return .unknown }
         guard now >= validatedAt else { return .validationRequired(since: nil) }
 
-        var usableUntil = validatedAt.addingTimeInterval(effectiveValidationInterval)
-        if isActiveState {
-            if let businessExpiry { usableUntil = min(usableUntil, businessExpiry) }
-            if let signedLicenseTokenExpiresAt { usableUntil = min(usableUntil, signedLicenseTokenExpiresAt) }
+        var freshUntil = validatedAt.addingTimeInterval(effectiveValidationInterval)
+        if let businessExpiry { freshUntil = min(freshUntil, businessExpiry) }
+        if now < freshUntil { return .fresh(until: freshUntil) }
+        if let businessExpiry, now >= businessExpiry {
+            return .validationRequired(since: businessExpiry)
         }
-        if now < usableUntil { return .fresh(until: usableUntil) }
-        return .validationRequired(since: usableUntil)
+        guard let offlineGracePeriod else {
+            return .validationRequired(since: freshUntil)
+        }
+        let graceUntil = validatedAt.addingTimeInterval(offlineGracePeriod)
+        if now < graceUntil { return .offlineGrace(until: graceUntil) }
+        return .offlineGraceExceeded(since: graceUntil)
     }
 
     public func isUsable(at now: Date = Date()) -> Bool {
         guard isActiveState else { return false }
-        if signedLicenseTokenExpiresAt != nil, signedCredentialValid != true { return false }
-        guard case .fresh = freshness(at: now) else { return false }
+        if let businessExpiry, now >= businessExpiry { return false }
+        if signedCredentialValid == false { return false }
         return true
     }
 
@@ -165,6 +175,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
             validatedAt: validatedAt,
             receivedValidationInterval: receivedValidationInterval,
             effectiveValidationInterval: effectiveValidationInterval,
+            offlineGracePeriod: offlineGracePeriod,
             lastValidateResponseAt: lastValidateResponseAt
         )
     }
@@ -176,7 +187,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
             validatedAt: validatedAt,
             receivedValidationInterval: receivedValidationInterval,
             effectiveValidationInterval: effectiveValidationInterval,
-            signedLicenseTokenExpiresAt: signedLicenseTokenExpiresAt,
+            offlineGracePeriod: offlineGracePeriod,
             lastValidateResponseAt: lastValidateResponseAt,
             signedCredentialValid: signedCredentialValid,
             businessCode: businessCode,
@@ -194,7 +205,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
             validatedAt: validatedAt,
             receivedValidationInterval: receivedValidationInterval,
             effectiveValidationInterval: effectiveValidationInterval,
-            signedLicenseTokenExpiresAt: signedLicenseTokenExpiresAt,
+            offlineGracePeriod: offlineGracePeriod,
             lastValidateResponseAt: receivedAt,
             signedCredentialValid: signedCredentialValid ?? self.signedCredentialValid,
             businessCode: businessCode,
@@ -212,7 +223,7 @@ public struct EntitlementSnapshot: Codable, Equatable, Sendable {
             validatedAt: validatedAt,
             receivedValidationInterval: receivedValidationInterval,
             effectiveValidationInterval: effectiveValidationInterval,
-            signedLicenseTokenExpiresAt: signedLicenseTokenExpiresAt,
+            offlineGracePeriod: offlineGracePeriod,
             lastValidateResponseAt: lastValidateResponseAt,
             signedCredentialValid: isValid,
             businessCode: businessCode,
