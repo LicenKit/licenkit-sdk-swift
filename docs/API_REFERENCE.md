@@ -89,7 +89,14 @@ public enum EntitlementState: Codable, Equatable, Sendable {
     case activationRequired(trial: TrialAvailability)
     case trial(TrialEntitlement)
     case license(LicenseEntitlement)
-    case releaseNotEligible(ReleaseEligibilityIssue)
+    case licenseNotValidForVersion(
+        code: String,
+        updatesUntil: Date,
+        releaseVersion: String,
+        releasePlatform: String,
+        releaseArch: String,
+        releasedAt: Date
+    )
     case unknown
 }
 
@@ -119,19 +126,9 @@ public enum LicenseEntitlement: Codable, Equatable, Sendable {
     case activationDeactivated
 }
 
-public enum ReleaseEligibilityIssue: Codable, Equatable, Sendable {
-    case updateRequired(
-        code: String,
-        updatesUntil: Date?,
-        releaseVersion: String,
-        releasePlatform: String,
-        releaseArch: String,
-        releasedAt: Date?
-    )
-}
 ```
 
-`releaseNotEligible` 只表达 Server 已查到对应 Product Release，且它的发布时间晚于永久授权的 `updates_until`。没有登记 Release 时 Server 按宽容策略继续校验，不产生“未知版本”状态。Product 不存在或已归档仍返回 `.failure` 中的服务端原始错误，而不是扩充 `TrialUnavailableReason`。
+`licenseNotValidForVersion` 只表达 Server 已查到对应 Product Release，且它的发布时间晚于永久授权的 `updates_until`。`updatesUntil` 与 `releasedAt` 是服务端得出该结论的必要事实，因此不是可选值；缺失时 SDK 返回协议错误，不构造残缺状态。没有登记 Release 时 Server 按宽容策略继续校验，不产生“未知版本”状态。Product 不存在或已归档仍返回 `.failure` 中的服务端原始错误，而不是扩充 `TrialUnavailableReason`。
 
 ## 快照、新鲜度与功能
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Replaced `releaseNotEligible(.updateRequired(...))` with the direct `licenseNotValidForVersion(...)` entitlement state so host applications can present the actual License/version mismatch without interpreting an ambiguous update action.
+- `licenseNotValidForVersion` now requires both `updatesUntil` and `releasedAt`; malformed Server responses missing either fact fail as protocol errors while preserving operation diagnostics.
+
 ## [0.4.0] - 2026-09-27
 
 ### Changed

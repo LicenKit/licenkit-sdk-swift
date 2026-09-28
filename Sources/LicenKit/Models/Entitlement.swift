@@ -70,22 +70,18 @@ public enum LicenseEntitlement: Codable, Equatable, Sendable {
     case activationDeactivated
 }
 
-public enum ReleaseEligibilityIssue: Codable, Equatable, Sendable {
-    case updateRequired(
-        code: String,
-        updatesUntil: Date?,
-        releaseVersion: String,
-        releasePlatform: String,
-        releaseArch: String,
-        releasedAt: Date?
-    )
-}
-
 public enum EntitlementState: Codable, Equatable, Sendable {
     case activationRequired(trial: TrialAvailability)
     case trial(TrialEntitlement)
     case license(LicenseEntitlement)
-    case releaseNotEligible(ReleaseEligibilityIssue)
+    case licenseNotValidForVersion(
+        code: String,
+        updatesUntil: Date,
+        releaseVersion: String,
+        releasePlatform: String,
+        releaseArch: String,
+        releasedAt: Date
+    )
     case unknown
 }
 

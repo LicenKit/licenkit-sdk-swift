@@ -229,28 +229,30 @@ final class V1ContractTests: XCTestCase {
         }
     }
 
-    func testUpdateRequiredIsNotLicenseExpiry() async throws {
+    func testLicenseNotValidForVersionIsNotLicenseExpiry() async throws {
         let state: [String: Any] = [
             "kind": "release_not_eligible", "status": "update_required",
             "code": "UPDATE_ENTITLEMENT_REQUIRED", "updates_until": "2029-01-01T00:00:00Z",
             "release_version": "2.4.0", "release_platform": "macos", "release_arch": "arm64",
             "released_at": "2030-01-01T00:00:00Z"
         ]
-        let expected = EntitlementState.releaseNotEligible(.updateRequired(
+        let expected = EntitlementState.licenseNotValidForVersion(
             code: "UPDATE_ENTITLEMENT_REQUIRED",
-            updatesUntil: FlexibleDate.parseISO8601("2029-01-01T00:00:00Z"),
+            updatesUntil: FlexibleDate.parseISO8601("2029-01-01T00:00:00Z")!,
             releaseVersion: "2.4.0",
             releasePlatform: "macos",
             releaseArch: "arm64",
             releasedAt: validatedAt
-        ))
+        )
         setJSONResponse(data: validateData(state: state))
-        let result = await makeClient(store: MemoryCredentialStore()).validate()
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(opaqueCredentials(), for: fingerprint)
+        let result = await makeClient(store: store).validate()
         guard case .success(let snapshot, _) = result else { return XCTFail("Expected success") }
         XCTAssertEqual(snapshot.state, expected)
     }
 
-    func testReleaseStatesRejectMissingIdentityFields() async throws {
+    func testReleaseStatesRejectMissingRequiredFacts() async throws {
         let states: [[String: Any]] = [
             ["kind": "release_not_eligible", "status": "update_required", "code": "UPDATE_ENTITLEMENT_REQUIRED"],
             [
@@ -258,12 +260,24 @@ final class V1ContractTests: XCTestCase {
                 "code": "UPDATE_ENTITLEMENT_REQUIRED", "release_version": "2.4.0",
                 "release_platform": "macos"
             ],
+            [
+                "kind": "release_not_eligible", "status": "update_required",
+                "code": "UPDATE_ENTITLEMENT_REQUIRED", "release_version": "2.4.0",
+                "release_platform": "macos", "release_arch": "arm64",
+                "released_at": "2030-01-01T00:00:00Z"
+            ],
+            [
+                "kind": "release_not_eligible", "status": "update_required",
+                "code": "UPDATE_ENTITLEMENT_REQUIRED", "release_version": "2.4.0",
+                "release_platform": "macos", "release_arch": "arm64",
+                "updates_until": "2029-01-01T00:00:00Z"
+            ],
         ]
         for state in states {
             setJSONResponse(data: validateData(state: state))
             let result = await makeClient(store: MemoryCredentialStore()).validate()
             guard case .failure(.protocolError, _, let metadata) = result else {
-                return XCTFail("Expected missing Release identity to fail")
+                return XCTFail("Expected missing License/version facts to fail")
             }
             XCTAssertEqual(metadata.requestID, "req_1")
         }

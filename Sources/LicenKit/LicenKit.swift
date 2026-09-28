@@ -757,20 +757,20 @@ public final class LicenKit: @unchecked Sendable {
                 try requireCode("UPDATE_ENTITLEMENT_REQUIRED", in: state)
                 guard let releaseVersion = state.releaseVersion,
                       let releasePlatform = state.releasePlatform,
-                      let releaseArch = state.releaseArch else {
+                      let releaseArch = state.releaseArch,
+                      let updatesUntil = state.updatesUntil?.date,
+                      let releasedAt = state.releasedAt?.date else {
                     throw LicenKitError.protocolError(
-                        reason: "update-required Release state is missing its build identity"
+                        reason: "license-not-valid-for-version state is missing required facts"
                     )
                 }
-                return .releaseNotEligible(
-                    .updateRequired(
-                        code: "UPDATE_ENTITLEMENT_REQUIRED",
-                        updatesUntil: state.updatesUntil?.date,
-                        releaseVersion: releaseVersion,
-                        releasePlatform: releasePlatform,
-                        releaseArch: releaseArch,
-                        releasedAt: state.releasedAt?.date
-                    )
+                return .licenseNotValidForVersion(
+                    code: "UPDATE_ENTITLEMENT_REQUIRED",
+                    updatesUntil: updatesUntil,
+                    releaseVersion: releaseVersion,
+                    releasePlatform: releasePlatform,
+                    releaseArch: releaseArch,
+                    releasedAt: releasedAt
                 )
             default:
                 throw LicenKitError.protocolError(reason: "unknown Release eligibility status")
@@ -792,9 +792,9 @@ public final class LicenKit: @unchecked Sendable {
     ) throws {
         let valid: Bool
         switch (subject, state) {
-        case (.license, .license), (.license, .releaseNotEligible),
-             (.trial, .trial), (.trial, .releaseNotEligible),
-             (.none, .activationRequired), (.none, .releaseNotEligible):
+        case (.license, .license), (.license, .licenseNotValidForVersion),
+             (.trial, .trial),
+             (.none, .activationRequired):
             valid = true
         default:
             valid = false
