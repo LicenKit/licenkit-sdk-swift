@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-28
+
+### Added
+- 新增只读的 `restoreLocalEntitlement()`，在网络复核前明确交付本机可用、已确认阻断或需要核验的结论；新保存的缓存快照与具体 License/Trial 凭据绑定，旧的未绑定快照需先在线复核。
+- 解绑请求前持久化恢复记录；远端已确认而本机清理失败时返回独立结果，进程重启后可重试 `deactivate()` 完成清理。
+
+### Fixed
+- 已缓存的 active Signed License 跨过业务到期日后，静默或用户主动复核可以请求服务端；签名与快照真实不一致仍返回原始错误。
+
 ## [0.7.0] - 2026-09-28
 
 ### Changed
