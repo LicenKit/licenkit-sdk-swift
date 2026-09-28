@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-28
+
+### Changed
+- `validate(trigger:)` 区分用户主动与宿主静默复核；Product 间隔只限制静默调用，固定 30 秒从请求尝试开始计时。
+- Trial/License 首次到期、Release 身份变化首次静默复核及 Signed Token 本地失效可跳过 Product 间隔；两种本地跳过原因提供不同代码和可重试时间。
+- 缺少或无效的内置签名公钥保留配置错误；旧的无参数 `validate()` 暂按静默模式执行并标记弃用。
+- 自定义 `CredentialStore` 实现需新增校验请求尝试的读写方法；旧快照缺少 Release 身份时可正常解码，并在下一次静默调用中提前复核一次。
+
 ## [0.6.0] - 2026-09-28
 
 ### Added
