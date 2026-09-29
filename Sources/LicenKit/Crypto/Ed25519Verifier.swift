@@ -69,12 +69,13 @@ public struct Ed25519Verifier: Sendable {
         let requiredClaims: Set<String> = [
             "lic", "act", "ins", "prd", "ver", "plt", "arc", "fp", "iat", "lexp", "upd", "fea"
         ]
+        let allowedClaims = requiredClaims.union(["env"])
         guard requiredClaims.isSubset(of: Set(payloadDictionary.keys)) else {
             let missing = requiredClaims.subtracting(Set(payloadDictionary.keys)).sorted().joined(separator: ",")
             throw LicenKitError.invalidSignedLicenseToken(reason: "required claims are missing: \(missing)")
         }
-        guard Set(payloadDictionary.keys) == requiredClaims else {
-            let unsupported = Set(payloadDictionary.keys).subtracting(requiredClaims).sorted().joined(separator: ",")
+        guard Set(payloadDictionary.keys).isSubset(of: allowedClaims) else {
+            let unsupported = Set(payloadDictionary.keys).subtracting(allowedClaims).sorted().joined(separator: ",")
             throw LicenKitError.invalidSignedLicenseToken(reason: "unsupported claims are present: \(unsupported)")
         }
         let claims: LicenseClaims

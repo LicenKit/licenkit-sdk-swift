@@ -1493,6 +1493,47 @@ final class V1ContractTests: XCTestCase {
         ))
     }
 
+    func testSignedActivationAcceptsLiveEnvironmentClaim() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let token = try makeToken(privateKey: key, environment: "live")
+        var data = activationData(mode: "signed", token: token, keyID: "key_1")
+        data["billing_environment"] = "live"
+        setJSONResponse(data: data)
+
+        let store = MemoryCredentialStore()
+        let client = makeClient(
+            store: store,
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
+        )
+        guard case .success(let activation, _) = await client.activate(licenseKey: "LK") else {
+            return XCTFail("A live Signed License must activate")
+        }
+        XCTAssertEqual(activation.credentialMode, .signed)
+        XCTAssertEqual(try store.loadCredentials(for: fingerprint)?.environment, .live)
+        guard case .usable = await client.restoreLocalEntitlement() else {
+            return XCTFail("The activated Signed License must restore locally")
+        }
+    }
+
+    func testSignedActivationRejectsSandboxClaimInLiveEnvironment() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let token = try makeToken(privateKey: key, environment: "sandbox")
+        var data = activationData(mode: "signed", token: token, keyID: "key_1")
+        data["billing_environment"] = "live"
+        setJSONResponse(data: data)
+
+        let store = MemoryCredentialStore()
+        let result = await makeClient(
+            store: store,
+            signingPublicKey: key.publicKey.rawRepresentation.base64EncodedString()
+        ).activate(licenseKey: "LK")
+        guard case .failure(.invalidSignedLicenseToken(let reason), _, _) = result else {
+            return XCTFail("A Sandbox token must not activate a live App")
+        }
+        XCTAssertTrue(reason.contains("environment does not match"))
+        XCTAssertNil(try store.loadCredentials(for: fingerprint))
+    }
+
     func testOpaqueSandboxCredentialCannotRestoreOrValidateInLiveConfiguration() async throws {
         let store = MemoryCredentialStore()
         try store.saveCredentials(.init(
@@ -2205,6 +2246,7 @@ final class V1ContractTests: XCTestCase {
         privateKey: Curve25519.Signing.PrivateKey,
         features: [String] = ["export"],
         licenseExpiresAt: Date? = nil,
+        environment: String? = nil,
         legacyAccountClaim: Bool = false,
         legacyExpirationClaim: Date? = nil
     ) throws -> String {
@@ -2217,6 +2259,7 @@ final class V1ContractTests: XCTestCase {
             "fea": features
         ]
         if let licenseExpiresAt { payload["lexp"] = Int64(licenseExpiresAt.timeIntervalSince1970) }
+        if let environment { payload["env"] = environment }
         if legacyAccountClaim { payload["acc"] = "acc_legacy" }
         if let legacyExpirationClaim {
             payload["exp"] = Int64(legacyExpirationClaim.timeIntervalSince1970)

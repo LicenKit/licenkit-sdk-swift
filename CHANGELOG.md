@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-29
+
+### Fixed
+- 修复含 `env` 的 Signed License Token 被严格字段校验误拒；继续接受旧版无 `env` 的 Live Token，并保留未知字段与环境不匹配检查。
+
 ## [0.9.0] - 2026-09-29
 
 ### Added
