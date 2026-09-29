@@ -57,6 +57,7 @@ let manualResult = await LicenKit.shared.validate(trigger: .userInitiated)
 - `serverURL`：LicenKit 服务根地址；
 - `productID`：Admin 产品页展示的全局唯一 Product ID；
 - `signingPublicKey`：Admin 产品页交付的 Ed25519 公钥。仅使用 `opaque` 凭证时可省略；使用 `signed` 凭证时必须提供。
+- `environment`：宿主 App 的运行环境；正式版默认 `.live`，Sandbox 测试版显式传入 `.sandbox`。SDK 会检查在线响应、本地凭证和 Signed License Token 的授权环境，并分开保存两种环境的 Keychain 数据。
 
 SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号；操作系统固定识别为 `macos`，主可执行文件架构单独推导为 `arm64`、`x86_64` 或 `universal`。这些值作为 `release_version + release_platform + release_arch` 随请求发送，但宿主业务代码不需要配置。缺少构建信息时操作会明确返回配置错误。网络超时固定为 SDK 内部的 15 秒；Keychain 只供当前 App 使用，不暴露 Access Group 配置。
 

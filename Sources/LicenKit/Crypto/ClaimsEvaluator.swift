@@ -17,6 +17,9 @@ struct ClaimsEvaluator: Sendable {
         guard claims.productID == configuration.productID else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token product does not match SDK configuration")
         }
+        guard (claims.environment ?? .live) == configuration.environment else {
+            throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token environment does not match SDK configuration")
+        }
         guard claims.activationID == activationID else {
             throw LicenKitError.invalidSignedLicenseToken(reason: "Signed License Token activation does not match stored credentials")
         }

@@ -6,19 +6,22 @@ public struct StoredCredentials: Codable, Equatable, Sendable {
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
     public let signingKeyID: String?
+    public let environment: LicenKitEnvironment?
 
     public init(
         activationID: String,
         machineToken: String,
         credentialMode: CredentialMode,
         signedLicenseToken: String?,
-        signingKeyID: String?
+        signingKeyID: String?,
+        environment: LicenKitEnvironment? = nil
     ) {
         self.activationID = activationID
         self.machineToken = machineToken
         self.credentialMode = credentialMode
         self.signedLicenseToken = signedLicenseToken
         self.signingKeyID = signingKeyID
+        self.environment = environment
     }
 }
 

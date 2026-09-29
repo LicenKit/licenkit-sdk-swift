@@ -9,11 +9,13 @@ public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
     public let productID: String
     public let signingPublicKey: String?
+    public let environment: LicenKitEnvironment
 
     public init(
         serverURL: URL,
         productID: String,
-        signingPublicKey: String? = nil
+        signingPublicKey: String? = nil,
+        environment: LicenKitEnvironment = .live
     )
 }
 
@@ -44,6 +46,8 @@ public final class LicenKit: @unchecked Sendable {
 `productID` 是 Admin 产品页展示的全局唯一产品标识，Server 据此解析租户边界，客户端不再传入 `instanceID`。
 
 `signingPublicKey` 是 Admin 产品页交付的 Ed25519 公钥，支持原始 32 字节公钥的 Base64，或 Ed25519 SPKI PEM/Base64。仅使用 `opaque` 凭证时可以省略；`signed` 凭证需要它完成离线验签。当前公共 API 只接受一个公钥，不把服务端下载的数据自动提升为信任根。
+
+`environment` 是宿主 App 构建时确定的运行环境。正式版默认 `.live`，Sandbox 测试版必须显式使用 `.sandbox`。SDK 在激活、在线校验请求中提交该配置，核对响应与本地缓存中的 License 环境，并在 `signed` 模式核对签名令牌的 `env` Claim。两种环境使用不同的 Keychain Service；旧版未标记环境的 Live 凭证继续按 `.live` 读取。服务端会独立检查 License 已固化的环境，HTTP 请求中的环境声明本身不能替代宿主 App 对构建配置的可信管理。
 
 构建身份不再由业务代码传入。SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号，将操作系统标识为 `macos`，并根据主可执行文件架构单独推导 `arm64`、`x86_64` 或 `universal`；无法取得时返回 `.configurationError`。请求使用独立的 `release_version`、`release_platform` 与 `release_arch` 字段。请求超时固定为 SDK 内部的 15 秒，Keychain 使用当前 App 私有命名空间，不暴露 Access Group。
 

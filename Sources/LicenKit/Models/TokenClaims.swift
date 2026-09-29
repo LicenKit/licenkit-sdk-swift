@@ -17,6 +17,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
     public let activationID: String
     public let instanceID: String
     public let productID: String
+    public let environment: LicenKitEnvironment?
     public let releaseVersion: String
     public let releasePlatform: String
     public let releaseArch: String
@@ -31,6 +32,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         case activationID = "act"
         case instanceID = "ins"
         case productID = "prd"
+        case environment = "env"
         case releaseVersion = "ver"
         case releasePlatform = "plt"
         case releaseArch = "arc"
@@ -49,6 +51,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         activationID: String,
         instanceID: String,
         productID: String,
+        environment: LicenKitEnvironment? = nil,
         releaseVersion: String,
         releasePlatform: String,
         releaseArch: String,
@@ -62,6 +65,7 @@ public struct LicenseClaims: Codable, Equatable, Sendable {
         self.activationID = activationID
         self.instanceID = instanceID
         self.productID = productID
+        self.environment = environment
         self.releaseVersion = releaseVersion
         self.releasePlatform = releasePlatform
         self.releaseArch = releaseArch

@@ -4,8 +4,8 @@ import Security
 public struct KeychainStore: CredentialStore, Sendable {
     public let service: String
 
-    public init(productID: String) {
-        self.service = "com.licenkit.client.\(productID)"
+    public init(productID: String, environment: LicenKitEnvironment = .live) {
+        self.service = "com.licenkit.client.\(productID)\(environment == .sandbox ? ".sandbox" : "")"
     }
 
     public func loadDeactivationAttempt(for fingerprint: String) throws -> StoredDeactivationAttempt? {

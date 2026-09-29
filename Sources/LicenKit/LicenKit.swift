@@ -55,7 +55,7 @@ public final class LicenKit: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.configuration = configuration
-        self.credentialStore = credentialStore ?? KeychainStore(productID: configuration.productID)
+        self.credentialStore = credentialStore ?? KeychainStore(productID: configuration.productID, environment: configuration.environment)
         #if os(macOS)
         self.fingerprintProvider = fingerprintProvider ?? MacOSFingerprintProvider()
         #else
@@ -121,6 +121,9 @@ public final class LicenKit: @unchecked Sendable {
                 return .verificationRequired(reason: .deactivationPending(phase: pending.phase))
             }
             let license = try credentialStore.loadCredentials(for: fingerprint)
+            if let license, (license.environment ?? .live) != configuration.environment {
+                return .verificationRequired(reason: .invalidCredential(.protocolError(reason: "stored License environment does not match SDK configuration")))
+            }
             let trial = try credentialStore.loadTrialCredentials(for: fingerprint)
             let subject: StoredCredentialSubject = license != nil ? .license : (trial != nil ? .trial : .none)
             guard let stored = try credentialStore.loadSnapshot(for: fingerprint) else {
@@ -209,6 +212,7 @@ public final class LicenKit: @unchecked Sendable {
         trial: StoredTrialCredentials?
     ) -> Bool {
         guard stored.subject == subject else { return false }
+        if let license, (license.environment ?? .live) != configuration.environment { return false }
         if subject == .none { return isConfirmedNoCredentialBlock(stored) }
         guard stored.snapshot.source == .server else { return false }
         guard let binding = Self.credentialBinding(
@@ -291,7 +295,8 @@ public final class LicenKit: @unchecked Sendable {
                 name: requestedMachineName,
                 releaseVersion: build.version,
                 releasePlatform: build.platform,
-                releaseArch: build.arch
+                releaseArch: build.arch,
+                billingEnvironment: configuration.environment
             ))
             responseRequestID = response.meta.requestID
             guard response.machineToken == verification.machineToken else {
@@ -429,6 +434,9 @@ public final class LicenKit: @unchecked Sendable {
             validationFingerprint = fingerprint
             try requireNoPendingDeactivation(for: fingerprint, allowUnconfirmedRequest: true)
             let license = try credentialStore.loadCredentials(for: fingerprint)
+            if let license, (license.environment ?? .live) != configuration.environment {
+                throw LicenKitError.protocolError(reason: "stored License environment does not match SDK configuration")
+            }
             let trial = try credentialStore.loadTrialCredentials(for: fingerprint)
             let subject: StoredCredentialSubject
             let credential: APIValidationCredential
@@ -496,6 +504,7 @@ public final class LicenKit: @unchecked Sendable {
                 releaseVersion: build.version,
                 releasePlatform: build.platform,
                 releaseArch: build.arch,
+                billingEnvironment: configuration.environment,
                 credential: credential
             ))
             let responseReceivedAt = now()
@@ -516,6 +525,9 @@ public final class LicenKit: @unchecked Sendable {
             try require(snapshot.state, isValidFor: subject)
 
             if case .license(.active) = snapshot.state {
+                guard (response.billingEnvironment ?? .live) == configuration.environment else {
+                    throw LicenKitError.protocolError(reason: "License validation environment does not match SDK configuration")
+                }
                 guard let license, let update = response.credentialUpdate else {
                     throw LicenKitError.protocolError(
                         reason: "active License validation is missing credential_update"
@@ -762,9 +774,13 @@ public final class LicenKit: @unchecked Sendable {
             machineToken: response.machineToken,
             credentialMode: response.credentialMode,
             signedLicenseToken: response.signedLicenseToken,
-            signingKeyID: response.signingKeyID
+            signingKeyID: response.signingKeyID,
+            environment: response.billingEnvironment
         )
         try validateCredentialShape(credentials)
+        guard (credentials.environment ?? .live) == configuration.environment else {
+            throw LicenKitError.protocolError(reason: "License activation environment does not match SDK configuration")
+        }
         if credentials.credentialMode == .signed {
             _ = try signedEvaluation(credentials, fingerprint: fingerprint)
         }
@@ -785,9 +801,13 @@ public final class LicenKit: @unchecked Sendable {
             machineToken: current.machineToken,
             credentialMode: update.credentialMode,
             signedLicenseToken: update.signedLicenseToken,
-            signingKeyID: update.signingKeyID
+            signingKeyID: update.signingKeyID,
+            environment: update.billingEnvironment
         )
         try validateCredentialShape(updated)
+        guard (updated.environment ?? .live) == configuration.environment else {
+            throw LicenKitError.protocolError(reason: "License credential update environment does not match SDK configuration")
+        }
         return updated
     }
 

@@ -269,6 +269,7 @@ public struct APIActivateRequest: Codable, Sendable {
     public let releaseVersion: String
     public let releasePlatform: String
     public let releaseArch: String
+    public let billingEnvironment: LicenKitEnvironment
 
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
@@ -280,12 +281,14 @@ public struct APIActivateRequest: Codable, Sendable {
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
         case releaseArch = "release_arch"
+        case billingEnvironment = "billing_environment"
     }
 }
 
 public struct APICredentialResponse: Codable, Sendable {
     public let activationID: String
     public let machineToken: String
+    public let billingEnvironment: LicenKitEnvironment?
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
     public let signingKeyID: String?
@@ -298,6 +301,7 @@ public struct APICredentialResponse: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case activationID = "activation_id"
         case machineToken = "machine_token"
+        case billingEnvironment = "billing_environment"
         case credentialMode = "credential_mode"
         case signedLicenseToken = "signed_license_token"
         case signingKeyID = "signing_key_id"
@@ -342,6 +346,7 @@ public struct APIValidateRequest: Encodable, Sendable {
     public let releaseVersion: String
     public let releasePlatform: String
     public let releaseArch: String
+    public let billingEnvironment: LicenKitEnvironment
     public let credential: APIValidationCredential
 
     enum CodingKeys: String, CodingKey {
@@ -350,6 +355,7 @@ public struct APIValidateRequest: Encodable, Sendable {
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
         case releaseArch = "release_arch"
+        case billingEnvironment = "billing_environment"
         case credential
     }
 }
@@ -358,23 +364,27 @@ public struct APICredentialUpdate: Codable, Sendable {
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
     public let signingKeyID: String?
+    public let billingEnvironment: LicenKitEnvironment?
 
     enum CodingKeys: String, CodingKey {
         case credentialMode = "credential_mode"
         case signedLicenseToken = "signed_license_token"
         case signingKeyID = "signing_key_id"
+        case billingEnvironment = "billing_environment"
     }
 }
 
 public struct APIValidateResponse: Codable, Sendable {
     public let state: APIEntitlementState
     public let credentialUpdate: APICredentialUpdate?
+    public let billingEnvironment: LicenKitEnvironment?
     public let validation: APIValidationMetadata
     public let meta: APIResponseMetadata
 
     enum CodingKeys: String, CodingKey {
         case state, validation, meta
         case credentialUpdate = "credential_update"
+        case billingEnvironment = "billing_environment"
     }
 }
 

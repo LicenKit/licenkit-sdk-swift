@@ -1569,6 +1569,61 @@ final class V1ContractTests: XCTestCase {
         ))
     }
 
+    func testSignedLicenseEnvironmentRejectsSandboxInLiveAndPreservesLegacyLiveClaims() throws {
+        let sandboxClaims = LicenseClaims(
+            licenseID: "lic_1", activationID: "act_1", instanceID: "ins_1",
+            productID: "prd_1", environment: .sandbox, releaseVersion: "2.4.0",
+            releasePlatform: "macos", releaseArch: "arm64", fingerprint: fingerprint,
+            issuedAtTimestamp: Int64(validatedAt.timeIntervalSince1970),
+            licenseExpiresAtTimestamp: nil, updatesUntilTimestamp: nil, features: ["export"]
+        )
+        let evaluator = ClaimsEvaluator()
+        XCTAssertThrowsError(try evaluator.evaluate(
+            claims: sandboxClaims, configuration: configuration(signingPublicKey: nil),
+            activationID: "act_1", currentFingerprint: fingerprint, now: validatedAt
+        ))
+        XCTAssertNoThrow(try evaluator.evaluate(
+            claims: sandboxClaims, configuration: configuration(signingPublicKey: nil, environment: .sandbox),
+            activationID: "act_1", currentFingerprint: fingerprint, now: validatedAt
+        ))
+        let legacyLiveClaims = LicenseClaims(
+            licenseID: "lic_1", activationID: "act_1", instanceID: "ins_1",
+            productID: "prd_1", releaseVersion: "2.4.0", releasePlatform: "macos",
+            releaseArch: "arm64", fingerprint: fingerprint,
+            issuedAtTimestamp: Int64(validatedAt.timeIntervalSince1970),
+            licenseExpiresAtTimestamp: nil, updatesUntilTimestamp: nil, features: ["export"]
+        )
+        XCTAssertNoThrow(try evaluator.evaluate(
+            claims: legacyLiveClaims, configuration: configuration(signingPublicKey: nil),
+            activationID: "act_1", currentFingerprint: fingerprint, now: validatedAt
+        ))
+        XCTAssertThrowsError(try evaluator.evaluate(
+            claims: legacyLiveClaims, configuration: configuration(signingPublicKey: nil, environment: .sandbox),
+            activationID: "act_1", currentFingerprint: fingerprint, now: validatedAt
+        ))
+    }
+
+    func testOpaqueSandboxCredentialCannotRestoreOrValidateInLiveConfiguration() async throws {
+        let store = MemoryCredentialStore()
+        try store.saveCredentials(.init(
+            activationID: "act_1", machineToken: "mtk_secret", credentialMode: .opaque,
+            signedLicenseToken: nil, signingKeyID: nil, environment: .sandbox
+        ), for: fingerprint)
+        let requests = LockedBox(0)
+        setHandler { _ in
+            requests.mutate { $0 += 1 }
+            throw URLError(.notConnectedToInternet)
+        }
+        let client = makeClient(store: store)
+        guard case .verificationRequired(.invalidCredential) = await client.restoreLocalEntitlement() else {
+            return XCTFail("Live restoration must reject a stored Sandbox credential")
+        }
+        guard case .failure(.protocolError, _, _) = await client.validate(trigger: .userInitiated) else {
+            return XCTFail("Live validation must reject a stored Sandbox credential")
+        }
+        XCTAssertEqual(requests.get(), 0)
+    }
+
     func testMalformedResponsePreservesHeaderRequestID() async throws {
         let store = MemoryCredentialStore()
         let clock = MutableClock(validatedAt.addingTimeInterval(10))
@@ -2053,13 +2108,18 @@ final class V1ContractTests: XCTestCase {
     }
 
     private func configuration(signingPublicKey: String?) -> LicenKitConfiguration {
+        configuration(signingPublicKey: signingPublicKey, environment: .live)
+    }
+
+    private func configuration(signingPublicKey: String?, environment: LicenKitEnvironment) -> LicenKitConfiguration {
         LicenKitConfiguration(
             serverURL: URL(string: "https://mock.example")!,
             productID: "prd_1",
             signingPublicKey: signingPublicKey,
             releaseVersion: "2.4.0",
             releasePlatform: "macos",
-            releaseArch: "arm64"
+            releaseArch: "arm64",
+            environment: environment
         )
     }
 

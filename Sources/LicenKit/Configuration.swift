@@ -1,9 +1,15 @@
 import Foundation
 
+public enum LicenKitEnvironment: String, Codable, Equatable, Sendable {
+    case sandbox
+    case live
+}
+
 public struct LicenKitConfiguration: Sendable {
     public let serverURL: URL
     public let productID: String
     public let signingPublicKey: String?
+    public let environment: LicenKitEnvironment
 
     let releaseVersion: String
     let releasePlatform: String
@@ -12,11 +18,13 @@ public struct LicenKitConfiguration: Sendable {
     public init(
         serverURL: URL,
         productID: String,
-        signingPublicKey: String? = nil
+        signingPublicKey: String? = nil,
+        environment: LicenKitEnvironment = .live
     ) {
         self.serverURL = serverURL
         self.productID = productID
         self.signingPublicKey = signingPublicKey
+        self.environment = environment
         self.releaseVersion = Self.bundleReleaseVersion(Bundle.main) ?? ""
         self.releasePlatform = "macos"
         self.releaseArch = Self.bundleReleaseArchitecture(Bundle.main) ?? ""
@@ -28,11 +36,13 @@ public struct LicenKitConfiguration: Sendable {
         signingPublicKey: String? = nil,
         releaseVersion: String,
         releasePlatform: String,
-        releaseArch: String
+        releaseArch: String,
+        environment: LicenKitEnvironment = .live
     ) {
         self.serverURL = serverURL
         self.productID = productID
         self.signingPublicKey = signingPublicKey
+        self.environment = environment
         self.releaseVersion = releaseVersion
         self.releasePlatform = releasePlatform
         self.releaseArch = releaseArch
