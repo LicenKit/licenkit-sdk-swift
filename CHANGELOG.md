@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-29
+
+### Added
+- 新增 `LicenKitEnvironment`（`.live`、`.sandbox`），可在 `LicenKitConfiguration` 中显式指定运行环境（正式版默认 `.live`，Sandbox 测试版指定 `.sandbox`）。
+- Keychain 针对 Live 与 Sandbox 环境隔离存储命名空间（Sandbox 环境使用 `.sandbox` 命名后缀）。
+- 激活与校验请求提交 `billing_environment`，并在凭据恢复、服务端响应与签名 License Token（`env` Claim）中严格核验环境一致性。
+
+### Changed
+- 移除设备端临时验证令牌（`machine_token` 与 `trial_token`），重试激活与试用改由服务端依据设备指纹与激活记录保障幂等。
+- 简化凭据存储接口：从 `CredentialStore` 及 `KeychainStore` 中移除 `StoredActivationVerification`、`StoredTrialVerification` 相关方法，`StoredCredentials` 与 `StoredDeactivationAttempt` 不再持久化 `machineToken`。
+
 ## [0.8.0] - 2026-09-28
 
 ### Added
