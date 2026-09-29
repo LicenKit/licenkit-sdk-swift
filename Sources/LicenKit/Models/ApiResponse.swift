@@ -262,7 +262,6 @@ public struct APIEntitlementState: Codable, Equatable, Sendable {
 public struct APIActivateRequest: Codable, Sendable {
     public let productID: String
     public let licenseKey: String
-    public let machineToken: String
     public let fingerprint: String
     public let devicePlatform: String
     public let name: String?
@@ -274,7 +273,6 @@ public struct APIActivateRequest: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
         case licenseKey = "license_key"
-        case machineToken = "machine_token"
         case fingerprint
         case devicePlatform = "device_platform"
         case name
@@ -287,7 +285,6 @@ public struct APIActivateRequest: Codable, Sendable {
 
 public struct APICredentialResponse: Codable, Sendable {
     public let activationID: String
-    public let machineToken: String
     public let billingEnvironment: LicenKitEnvironment?
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
@@ -300,7 +297,6 @@ public struct APICredentialResponse: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case activationID = "activation_id"
-        case machineToken = "machine_token"
         case billingEnvironment = "billing_environment"
         case credentialMode = "credential_mode"
         case signedLicenseToken = "signed_license_token"
@@ -311,29 +307,25 @@ public struct APICredentialResponse: Codable, Sendable {
 }
 
 public enum APIValidationCredential: Encodable, Equatable, Sendable {
-    case license(activationID: String, machineToken: String)
-    case trial(trialID: String, trialToken: String)
+    case license(activationID: String)
+    case trial(trialID: String)
     case none
 
     private enum CodingKeys: String, CodingKey {
         case kind
         case activationID = "activation_id"
-        case machineToken = "machine_token"
         case trialID = "trial_id"
-        case trialToken = "trial_token"
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .license(let activationID, let machineToken):
+        case .license(let activationID):
             try container.encode("license", forKey: .kind)
             try container.encode(activationID, forKey: .activationID)
-            try container.encode(machineToken, forKey: .machineToken)
-        case .trial(let trialID, let trialToken):
+        case .trial(let trialID):
             try container.encode("trial", forKey: .kind)
             try container.encode(trialID, forKey: .trialID)
-            try container.encode(trialToken, forKey: .trialToken)
         case .none:
             try container.encode("none", forKey: .kind)
         }
@@ -391,13 +383,11 @@ public struct APIValidateResponse: Codable, Sendable {
 public struct APIDeactivateRequest: Codable, Sendable {
     public let productID: String
     public let activationID: String
-    public let machineToken: String
     public let fingerprint: String
 
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
         case activationID = "activation_id"
-        case machineToken = "machine_token"
         case fingerprint
     }
 }
@@ -416,7 +406,6 @@ public struct APIDeactivateResponse: Codable, Sendable {
 public struct APITrialClaimRequest: Codable, Sendable {
     public let productID: String
     public let fingerprint: String
-    public let trialToken: String
     public let devicePlatform: String
     public let releaseVersion: String
     public let releasePlatform: String
@@ -425,7 +414,6 @@ public struct APITrialClaimRequest: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case productID = "product_id"
         case fingerprint
-        case trialToken = "trial_token"
         case devicePlatform = "device_platform"
         case releaseVersion = "release_version"
         case releasePlatform = "release_platform"
@@ -435,7 +423,6 @@ public struct APITrialClaimRequest: Codable, Sendable {
 
 public struct APITrialClaimResponse: Codable, Sendable {
     public let trialID: String
-    public let trialToken: String
     public let status: String
     public let expiresAt: FlexibleDate
     public let features: [String]
@@ -445,7 +432,6 @@ public struct APITrialClaimResponse: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case trialID = "trial_id"
-        case trialToken = "trial_token"
         case status
         case expiresAt = "expires_at"
         case features, state, validation, meta

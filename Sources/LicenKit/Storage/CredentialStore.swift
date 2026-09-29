@@ -2,7 +2,6 @@ import Foundation
 
 public struct StoredCredentials: Codable, Equatable, Sendable {
     public let activationID: String
-    public let machineToken: String
     public let credentialMode: CredentialMode
     public let signedLicenseToken: String?
     public let signingKeyID: String?
@@ -10,14 +9,12 @@ public struct StoredCredentials: Codable, Equatable, Sendable {
 
     public init(
         activationID: String,
-        machineToken: String,
         credentialMode: CredentialMode,
         signedLicenseToken: String?,
         signingKeyID: String?,
         environment: LicenKitEnvironment? = nil
     ) {
         self.activationID = activationID
-        self.machineToken = machineToken
         self.credentialMode = credentialMode
         self.signedLicenseToken = signedLicenseToken
         self.signingKeyID = signingKeyID
@@ -25,29 +22,11 @@ public struct StoredCredentials: Codable, Equatable, Sendable {
     }
 }
 
-public struct StoredActivationVerification: Codable, Equatable, Sendable {
-    public let machineToken: String
-
-    public init(machineToken: String) {
-        self.machineToken = machineToken
-    }
-}
-
-public struct StoredTrialVerification: Codable, Equatable, Sendable {
-    public let trialToken: String
-
-    public init(trialToken: String) {
-        self.trialToken = trialToken
-    }
-}
-
 public struct StoredTrialCredentials: Codable, Equatable, Sendable {
     public let trialID: String
-    public let trialToken: String
 
-    public init(trialID: String, trialToken: String) {
+    public init(trialID: String) {
         self.trialID = trialID
-        self.trialToken = trialToken
     }
 }
 
@@ -86,13 +65,11 @@ public enum DeactivationAttemptPhase: String, Codable, Equatable, Sendable {
 
 public struct StoredDeactivationAttempt: Codable, Equatable, Sendable {
     public let activationID: String
-    public let machineToken: String
     public let phase: DeactivationAttemptPhase
     public let requestID: String?
 
-    public init(activationID: String, machineToken: String, phase: DeactivationAttemptPhase, requestID: String? = nil) {
+    public init(activationID: String, phase: DeactivationAttemptPhase, requestID: String? = nil) {
         self.activationID = activationID
-        self.machineToken = machineToken
         self.phase = phase
         self.requestID = requestID
     }
@@ -120,18 +97,12 @@ public protocol CredentialStore: Sendable {
     func clearDeactivationAttempt(for fingerprint: String) throws
     func loadValidationAttempt(for fingerprint: String) throws -> StoredValidationAttempt?
     func saveValidationAttempt(_ attempt: StoredValidationAttempt, for fingerprint: String) throws
-    func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification?
-    func saveActivationVerification(_ verification: StoredActivationVerification, for fingerprint: String) throws
-    func clearActivationVerification(for fingerprint: String) throws
     func loadCredentials(for fingerprint: String) throws -> StoredCredentials?
     func saveCredentials(_ credentials: StoredCredentials, for fingerprint: String) throws
     func clearCredentials(for fingerprint: String) throws
     func loadTrialCredentials(for fingerprint: String) throws -> StoredTrialCredentials?
     func saveTrialCredentials(_ credentials: StoredTrialCredentials, for fingerprint: String) throws
     func clearTrialCredentials(for fingerprint: String) throws
-    func loadTrialVerification(for fingerprint: String) throws -> StoredTrialVerification?
-    func saveTrialVerification(_ verification: StoredTrialVerification, for fingerprint: String) throws
-    func clearTrialVerification(for fingerprint: String) throws
     func loadSnapshot(for fingerprint: String) throws -> StoredEntitlementSnapshot?
     func saveSnapshot(_ snapshot: StoredEntitlementSnapshot, for fingerprint: String) throws
 }

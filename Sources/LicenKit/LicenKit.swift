@@ -1,5 +1,4 @@
 import Foundation
-import Security
 import CryptoKit
 
 public final class LicenKit: @unchecked Sendable {
@@ -194,9 +193,9 @@ public final class LicenKit: @unchecked Sendable {
     ) -> String? {
         let fields: [String]
         if let license {
-            fields = [productID, fingerprint, "license", license.activationID, license.machineToken]
+            fields = [productID, fingerprint, "license", license.activationID]
         } else if let trial {
-            fields = [productID, fingerprint, "trial", trial.trialID, trial.trialToken]
+            fields = [productID, fingerprint, "trial", trial.trialID]
         } else {
             return nil
         }
@@ -272,24 +271,10 @@ public final class LicenKit: @unchecked Sendable {
             let fingerprint = try await fingerprintProvider.getFingerprint()
             try requireNoPendingDeactivation(for: fingerprint)
             let requestedMachineName = machineName ?? ProcessInfo.processInfo.hostName
-            let verification: StoredActivationVerification
-            if let existing = try credentialStore.loadActivationVerification(for: fingerprint) {
-                verification = existing
-            } else {
-                let storedCredentials = try credentialStore.loadCredentials(for: fingerprint)
-                verification = StoredActivationVerification(
-                    machineToken: try (
-                        storedCredentials?.machineToken
-                            ?? Self.generateVerificationToken(prefix: "mtk")
-                    )
-                )
-                try credentialStore.saveActivationVerification(verification, for: fingerprint)
-            }
             requestStarted = true
             let response = try await apiClient.activate(request: APIActivateRequest(
                 productID: configuration.productID,
                 licenseKey: normalizedLicenseKey,
-                machineToken: verification.machineToken,
                 fingerprint: fingerprint,
                 devicePlatform: Self.devicePlatform,
                 name: requestedMachineName,
@@ -299,11 +284,6 @@ public final class LicenKit: @unchecked Sendable {
                 billingEnvironment: configuration.environment
             ))
             responseRequestID = response.meta.requestID
-            guard response.machineToken == verification.machineToken else {
-                throw LicenKitError.protocolError(
-                    reason: "activation response returned a different machine_token"
-                )
-            }
 
             let credentials = try credentials(
                 from: response,
@@ -325,7 +305,6 @@ public final class LicenKit: @unchecked Sendable {
             try credentialStore.saveCredentials(credentials, for: fingerprint)
             try credentialStore.clearTrialCredentials(for: fingerprint)
             try persist(snapshot: snapshot, subject: .license, fingerprint: fingerprint, validatedBuild: .init(version: build.version, platform: build.platform, arch: build.arch))
-            try credentialStore.clearActivationVerification(for: fingerprint)
             return .success(
                 value: ActivationData(
                     activationID: response.activationID,
@@ -359,34 +338,16 @@ public final class LicenKit: @unchecked Sendable {
             if let stored = try credentialStore.loadSnapshot(for: fingerprint) {
                 lastKnown = stored.snapshot
             }
-            let verification: StoredTrialVerification
-            if let existing = try credentialStore.loadTrialVerification(for: fingerprint) {
-                verification = existing
-            } else {
-                let trialToken = try (
-                    credentialStore.loadTrialCredentials(for: fingerprint)?.trialToken
-                        ?? Self.generateVerificationToken(prefix: "ttk")
-                )
-                verification = StoredTrialVerification(trialToken: trialToken)
-                try credentialStore.saveTrialVerification(verification, for: fingerprint)
-            }
             requestStarted = true
             let response = try await apiClient.claimTrial(request: APITrialClaimRequest(
                 productID: configuration.productID,
                 fingerprint: fingerprint,
-                trialToken: verification.trialToken,
                 devicePlatform: Self.devicePlatform,
                 releaseVersion: build.version,
                 releasePlatform: build.platform,
                 releaseArch: build.arch
             ))
             responseRequestID = response.meta.requestID
-            guard response.trialToken == verification.trialToken,
-                  !response.trialToken.isEmpty else {
-                throw LicenKitError.protocolError(
-                    reason: "trial claim response returned a different trial_token"
-                )
-            }
             let snapshot = try makeSnapshot(
                 state: response.state,
                 validation: response.validation
@@ -394,11 +355,10 @@ public final class LicenKit: @unchecked Sendable {
             try validateTrialClaimDuplicates(response, snapshot: snapshot)
 
             try credentialStore.saveTrialCredentials(
-                StoredTrialCredentials(trialID: response.trialID, trialToken: response.trialToken),
+                StoredTrialCredentials(trialID: response.trialID),
                 for: fingerprint
             )
             try persist(snapshot: snapshot, subject: .trial, fingerprint: fingerprint, validatedBuild: .init(version: build.version, platform: build.platform, arch: build.arch))
-            try credentialStore.clearTrialVerification(for: fingerprint)
             return .success(
                 value: snapshot,
                 metadata: operationMetadata(snapshot: snapshot, requestID: response.meta.requestID)
@@ -442,13 +402,10 @@ public final class LicenKit: @unchecked Sendable {
             let credential: APIValidationCredential
             if let license {
                 subject = .license
-                credential = .license(
-                    activationID: license.activationID,
-                    machineToken: license.machineToken
-                )
+                credential = .license(activationID: license.activationID)
             } else if let trial {
                 subject = .trial
-                credential = .trial(trialID: trial.trialID, trialToken: trial.trialToken)
+                credential = .trial(trialID: trial.trialID)
             } else {
                 subject = .none
                 credential = .none
@@ -560,17 +517,6 @@ public final class LicenKit: @unchecked Sendable {
                 confirmedResponseSubject = .some(.none)
             }
             try persist(snapshot: snapshot, subject: persistedSubject, fingerprint: fingerprint, validatedBuild: buildIdentity)
-            if persistedSubject == .license,
-               let license,
-               let verification = try credentialStore.loadActivationVerification(for: fingerprint),
-               verification.machineToken == license.machineToken {
-                try credentialStore.clearActivationVerification(for: fingerprint)
-            } else if persistedSubject == .trial,
-                      let trial,
-                      let verification = try credentialStore.loadTrialVerification(for: fingerprint),
-                      verification.trialToken == trial.trialToken {
-                try credentialStore.clearTrialVerification(for: fingerprint)
-            }
             return .success(
                 value: snapshot,
                 metadata: operationMetadata(snapshot: snapshot, requestID: response.meta.requestID)
@@ -653,7 +599,6 @@ public final class LicenKit: @unchecked Sendable {
             if attempt == nil, let credentials = try credentialStore.loadCredentials(for: fingerprint) {
                 let newAttempt = StoredDeactivationAttempt(
                     activationID: credentials.activationID,
-                    machineToken: credentials.machineToken,
                     phase: .requested
                 )
                 try credentialStore.saveDeactivationAttempt(newAttempt, for: fingerprint)
@@ -684,7 +629,6 @@ public final class LicenKit: @unchecked Sendable {
                 let response = try await apiClient.deactivate(request: APIDeactivateRequest(
                     productID: configuration.productID,
                     activationID: attempt.activationID,
-                    machineToken: attempt.machineToken,
                     fingerprint: fingerprint
                 ))
                 responseRequestID = response.meta.requestID
@@ -695,7 +639,6 @@ public final class LicenKit: @unchecked Sendable {
                 setCurrentSnapshot(localUnknownSnapshot(lastValidateResponseAt: nil))
                 attempt = StoredDeactivationAttempt(
                     activationID: attempt.activationID,
-                    machineToken: attempt.machineToken,
                     phase: .confirmed,
                     requestID: responseRequestID
                 )
@@ -764,14 +707,13 @@ public final class LicenKit: @unchecked Sendable {
         from response: APICredentialResponse,
         fingerprint: String
     ) throws -> StoredCredentials {
-        guard !response.activationID.isEmpty, !response.machineToken.isEmpty else {
+        guard !response.activationID.isEmpty else {
             throw LicenKitError.protocolError(
-                reason: "credential response is missing activation_id or machine_token"
+                reason: "credential response is missing activation_id"
             )
         }
         let credentials = StoredCredentials(
             activationID: response.activationID,
-            machineToken: response.machineToken,
             credentialMode: response.credentialMode,
             signedLicenseToken: response.signedLicenseToken,
             signingKeyID: response.signingKeyID,
@@ -798,7 +740,6 @@ public final class LicenKit: @unchecked Sendable {
         }
         let updated = StoredCredentials(
             activationID: current.activationID,
-            machineToken: current.machineToken,
             credentialMode: update.credentialMode,
             signedLicenseToken: update.signedLicenseToken,
             signingKeyID: update.signingKeyID,
@@ -1395,22 +1336,6 @@ public final class LicenKit: @unchecked Sendable {
         case let (lhs?, rhs?): return abs(lhs.timeIntervalSince(rhs)) < 0.001
         default: return false
         }
-    }
-
-    private static func generateVerificationToken(prefix: String) throws -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard status == errSecSuccess else {
-            throw LicenKitError.credentialStorageError(
-                operation: "generate verification token",
-                status: status
-            )
-        }
-        let encoded = Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        return "\(prefix)_\(encoded)"
     }
 
     private static var devicePlatform: String {

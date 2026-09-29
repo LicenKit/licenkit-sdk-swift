@@ -28,18 +28,6 @@ public struct KeychainStore: CredentialStore, Sendable {
         try write(attempt, account: accountKey(prefix: "validation-attempt", fingerprint: fingerprint))
     }
 
-    public func loadActivationVerification(for fingerprint: String) throws -> StoredActivationVerification? {
-        try read(StoredActivationVerification.self, account: accountKey(prefix: "activation-verification", fingerprint: fingerprint))
-    }
-
-    public func saveActivationVerification(_ verification: StoredActivationVerification, for fingerprint: String) throws {
-        try write(verification, account: accountKey(prefix: "activation-verification", fingerprint: fingerprint))
-    }
-
-    public func clearActivationVerification(for fingerprint: String) throws {
-        try delete(account: accountKey(prefix: "activation-verification", fingerprint: fingerprint))
-    }
-
     public func loadCredentials(for fingerprint: String) throws -> StoredCredentials? {
         try read(StoredCredentials.self, account: accountKey(prefix: "license", fingerprint: fingerprint))
     }
@@ -62,18 +50,6 @@ public struct KeychainStore: CredentialStore, Sendable {
 
     public func clearTrialCredentials(for fingerprint: String) throws {
         try delete(account: accountKey(prefix: "trial", fingerprint: fingerprint))
-    }
-
-    public func loadTrialVerification(for fingerprint: String) throws -> StoredTrialVerification? {
-        try read(StoredTrialVerification.self, account: accountKey(prefix: "trial-verification", fingerprint: fingerprint))
-    }
-
-    public func saveTrialVerification(_ verification: StoredTrialVerification, for fingerprint: String) throws {
-        try write(verification, account: accountKey(prefix: "trial-verification", fingerprint: fingerprint))
-    }
-
-    public func clearTrialVerification(for fingerprint: String) throws {
-        try delete(account: accountKey(prefix: "trial-verification", fingerprint: fingerprint))
     }
 
     public func loadSnapshot(for fingerprint: String) throws -> StoredEntitlementSnapshot? {
