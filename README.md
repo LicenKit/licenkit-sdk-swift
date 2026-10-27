@@ -1,99 +1,164 @@
 # LicenKit Swift SDK
 
-LicenKit Swift SDK 是面向 macOS App 的 V1 授权客户端。它用同一个快照模型表达 License、Product/设备 Trial、无凭据设备和 Release 资格，并把业务终态与网络/协议失败分开。
+**English** | [简体中文](./README.zh-CN.md)
 
-> 当前仓库内容是本地实现，不表示该版本已经发布，也不表示对应 LicenKit Server 已经部署到生产环境。
+Add license activation, device trials, and license checks to your macOS app with [LicenKit](https://github.com/LicenKit/licenkit).
 
-## 凭证模式
+- Activate a license key or start a device trial.
+- Restore saved license access at launch, then check with your server.
+- Verify signed licenses offline using an Ed25519 public key bundled with your app.
+- Store credentials in macOS Keychain, with separate storage for live and sandbox environments.
+- Use Swift concurrency (`async`/`await`) with no third-party dependencies.
 
-- `opaque`：保存 Machine Token；授权状态来自近期服务端校验，没有可离线验签的权益载荷。
-- `signed`：使用相同 Machine Token，并额外保存由 App 内置 Ed25519 公钥验证的 Signed License Token。
+## Requirements
 
-两种模式共享 `/activate`、`/validate` 和 `/deactivate`。Trial 首次通过 `/trials/claim` 领取，后续也走统一 `/validate`。
+- macOS 12 or later.
+- Swift 5.9 or later.
+- A LicenKit server and a product configured in its admin console.
 
-## 快速开始
+## Installation
+
+In Xcode, add a package dependency using this repository URL:
+
+```text
+https://github.com/LicenKit/licenkit-sdk-swift.git
+```
+
+Add the **LicenKit** library product to your app target, then import it:
 
 ```swift
+import LicenKit
+```
+
+## Quick start
+
+### 1. Configure the SDK
+
+Configure once before using `LicenKit.shared`:
+
+```swift
+import Foundation
+import LicenKit
+
 let configuration = LicenKitConfiguration(
-    serverURL: URL(string: "https://license.example.com")!,
-    productID: "prd_01...",
-    signingPublicKey: "base64-encoded-ed25519-public-key"
+    serverURL: URL(string: "https://licenses.example.com")!,
+    productID: "YOUR_PRODUCT_ID",
+    signingPublicKey: "YOUR_PRODUCT_SIGNING_PUBLIC_KEY"
 )
 
 LicenKit.configure(with: configuration)
-
-// 冷启动先等待本机结论。这一步不发网络请求。
-let local = await LicenKit.shared.restoreLocalEntitlement()
-let mayUseProtectedFeatures: Bool
-switch local {
-case .usable:
-    mayUseProtectedFeatures = true
-case .confirmedBlocked, .verificationRequired:
-    mayUseProtectedFeatures = false
-}
-// 宿主立即根据 mayUseProtectedFeatures 控制受保护功能。
-
-// 宿主随后在后台复核，并根据在线结果更新自己的访问决策。
-switch await LicenKit.shared.validate(trigger: .silent) {
-case .success(let snapshot, let metadata):
-    print(snapshot.state, metadata.requestID as Any)
-
-case .notPerformed(.minimumInterval(let retryAfter), let cached, _):
-    print("校验请求需等待 \(retryAfter) 秒", cached?.state as Any)
-
-case .notPerformed(.productInterval, let cached, _):
-    print(cached?.state as Any)
-
-case .failure(let error, let lastKnown, let metadata):
-    print(error, lastKnown?.state as Any, metadata.requestID as Any)
-}
-
-// 用户点击“检查授权”或“重试”时使用 .userInitiated。
-let manualResult = await LicenKit.shared.validate(trigger: .userInitiated)
 ```
 
-公共初始化参数只有：
+Replace the example values with your server address and the values shown on the product page in the admin console.
 
-- `serverURL`：LicenKit 服务根地址；
-- `productID`：Admin 产品页展示的全局唯一 Product ID；
-- `signingPublicKey`：Admin 产品页交付的 Ed25519 公钥。仅使用 `opaque` 凭证时可省略；使用 `signed` 凭证时必须提供。
-- `environment`：宿主 App 的运行环境；正式版默认 `.live`，Sandbox 测试版显式传入 `.sandbox`。SDK 会检查在线响应、本地凭证和 Signed License Token 的授权环境，并分开保存两种环境的 Keychain 数据。
+| Setting | What to provide |
+| --- | --- |
+| `serverURL` | Your LicenKit server's base URL, without `/api/v1/client`. |
+| `productID` | The product's globally unique ID from the admin console. |
+| `signingPublicKey` | The product's Ed25519 public key, bundled with your app. Required for `signed` licenses; omit it for `opaque` licenses. |
+| `environment` | Defaults to `.live`. Pass `.sandbox` explicitly in a sandbox build. |
 
-SDK 从宿主 App Bundle 的 `CFBundleShortVersionString` 读取版本号；操作系统固定识别为 `macos`，主可执行文件架构单独推导为 `arm64`、`x86_64` 或 `universal`。这些值作为 `release_version + release_platform + release_arch` 随请求发送，但宿主业务代码不需要配置。缺少构建信息时操作会明确返回配置错误。网络超时固定为 SDK 内部的 15 秒；Keychain 只供当前 App 使用，不暴露 Access Group 配置。
+The SDK reads your app version from `CFBundleShortVersionString` and detects its executable architecture (`arm64`, `x86_64`, or `universal`). Ensure this version is set in your app bundle; missing build information produces a configuration error.
 
-Product Release 不是所有授权的前置登记表。只有永久授权同时存在 `updates_until` 时，Server 才尝试用这组构建身份查询发布时间；未登记时按宽容策略继续放行，查到且 `released_at > updates_until` 时才返回需要更新权益。Signed License Token 不包含 Release ID、发布时间或独立 `exp`，本地只验证签名、构建身份、设备绑定和 License 业务期限。
+### 2. Restore access at launch
 
-写操作也返回显式结果，不通过 `throws` 隐藏上次状态：
+Run the following snippets in your app's asynchronous startup flow. First, restore the saved license or trial. This call does not make a network request.
 
 ```swift
-let activation = await LicenKit.shared.activate(licenseKey: userInput)
+let local = await LicenKit.shared.restoreLocalEntitlement()
+var canUseProtectedFeatures: Bool
+
+switch local {
+case .usable:
+    canUseProtectedFeatures = true
+case .confirmedBlocked, .verificationRequired:
+    canUseProtectedFeatures = false
+}
+
+// Apply canUseProtectedFeatures to your app's UI and protected features now.
+```
+
+`.usable` means the saved evidence permits access. `.confirmedBlocked` restores a previously confirmed state such as an expired or revoked license. `.verificationRequired` means the app needs a new check before granting access, for example on first launch or when saved credentials cannot be verified.
+
+### 3. Check with the server
+
+After applying the local decision, check in the background and update access when a new state is received:
+
+```swift
+switch await LicenKit.shared.validate(trigger: .silent) {
+case .success(let snapshot, _):
+    canUseProtectedFeatures = snapshot.isUsable()
+    // Update your UI and protected features using this result.
+
+case .notPerformed:
+    // No request was sent because a validation interval has not elapsed.
+    break
+
+case .failure(_, _, let metadata):
+    // A failed check does not by itself mean the license was revoked.
+    print("License check failed. Request ID:", metadata.requestID ?? "unavailable")
+}
+```
+
+Keep respecting license and trial expiry while your app is running. A network failure does not extend that expiry, and the SDK does not schedule checks or update your app's UI automatically.
+
+## Common operations
+
+Activate the license key entered by the user:
+
+```swift
+let activation = await LicenKit.shared.activate(licenseKey: "LICENSE_KEY_FROM_USER")
+```
+
+Start a device trial:
+
+```swift
 let trial = await LicenKit.shared.startTrial()
+```
+
+Check again when the user clicks “Check license” or “Retry”:
+
+```swift
+let validation = await LicenKit.shared.validate(trigger: .userInitiated)
+```
+
+Deactivate this device to release its license seat:
+
+```swift
 let deactivation = await LicenKit.shared.deactivate()
 ```
 
-## 宿主应用应遵守的边界
+Activation, trial, and validation calls return `LicenKitResult` with `.success`, `.notPerformed`, or `.failure`. A successful call means a state was obtained; check `snapshot.isUsable()` to decide whether access is allowed. For activation, the snapshot is available as `activationData.snapshot` in the success value.
 
-- 冷启动以 `restoreLocalEntitlement()` 的 `.usable` 作为立即开放受保护功能的依据；`.confirmedBlocked` 恢复已确认的业务阻断，其余结果需要重新取得可信结论。`currentSnapshot`、`failure.lastKnownValue` 或孤立的 `isUsable(at:)` 都不是冷启动凭据核验结果。SDK 本机结论不会自动发起在线复核，宿主随后调用 `validate(trigger:)` 并更新同一访问决策。
-- 在线复核间隔与离线宽限期只决定联网调度和提示强度，不会单独停用仍有效的授权。
-- `validate(trigger:)` 明确区分宿主静默复核与用户主动复核。所有新请求均受固定 30 秒限制；Product 在线复核间隔只限制静默调用。已知 Trial/License 首次到期、Release 身份变化后首次复核，以及 Signed Token 本地失效时，静默调用可跳过 Product 间隔。
-- 两种未执行原因分别为 `.minimumInterval` 与 `.productInterval`，对应独立的 SDK 本地代码；前者可在用户主动操作时提示剩余等待时间，后者通常无需展示。命中任一门槛都不发网络请求。
-- 30 秒从上次实际发出 `/validate` 请求时起算，包括随后超时或收到非法响应的请求；Product 间隔仍从上次明确服务端响应时起算。并发请求共享结果；静默跳过不会吞掉用户主动复核。
-- 两种门槛只约束 `validate`；`activate()`、`startTrial()` 与 `deactivate()` 不受限制，也不会启动该冷却。SDK 不在门槛结束时自动联网。
-- 合法 `/validate` 业务响应和明确 HTTP 失败会更新最近响应时间；DNS/TLS/超时等无 HTTP 响应失败及 2xx 非法正文不会更新。HTTP 失败不推进 `validatedAt`。
-- `failure.lastKnownValue` 只用于展示和故障上下文，不能冒充本次校验成功。
-- `businessCode`、安全的 `details` 与 `OperationMetadata.requestID` 应进入诊断链路；Registration Key、Machine Token、Trial Token 和 Signed Token 不得写入日志。
-- `deactivate()` 在请求前保存恢复记录。返回 `.remoteConfirmedLocalRepairRequired` 表示服务端已确认解绑，但本地清理尚未完成；保留原始本地错误、失败步骤和 Request ID。远端已确认时不再使用旧 License 放行。请求结果因断网未知时，保留已有可信本机授权和解绑重试记录；重试 `deactivate()` 会用原凭据确认远端结果。明确的服务端拒绝会清除恢复记录并保留原凭据。
-- Signed Token 不含 `exp`。Product 的 `validation_interval_seconds` 控制在线复核尝试频率；License Plan 的 `offline_grace_seconds` 在签发时固化到 License，超过后返回 `offlineGraceExceeded` 强提示但仍允许使用。
-- `activate()` 与 `startTrial()` 在请求前把客户端生成的 Token 写为验证中凭据；响应丢失、进程退出或最终凭据写入失败后，显式重试会复用同一 Token，由服务端重复下发同一份正式凭据。`validate()` 不执行这两个动作，其他设备不能只凭注册码或相同指纹取得既有凭据。
-- Product/设备 Trial 不等于 Paddle 免费订阅试用。后者得到普通 License Key，应调用 `activate()`。
+Deactivation returns `DeactivationResult`. If it returns `.remoteConfirmedLocalRepairRequired`, the server has deactivated the device but local cleanup needs another attempt. Stop using the old license and retry `deactivate()` to finish cleanup. See the [API reference](./docs/API_REFERENCE.md) for all result types.
 
-## 文档
+A device trial is separate from a payment provider's subscription trial. If the customer received a license key through a subscription trial, use `activate(licenseKey:)`.
 
-- [API 参考](./docs/API_REFERENCE.md)
-- [架构与安全边界](./docs/ARCHITECTURE.md)
-- [本地实现状态](./docs/IMPLEMENTATION_PLAN.md)
-- 服务端仓库中的[统一客户端校验开发指南](https://github.com/LicenKit/licenkit/blob/main/docs/zh-CN/unified-client-validation-guide.md)
+## License modes
 
-## 平台与依赖
+The product's license configuration determines the credential mode:
 
-实现使用 Swift Concurrency、Foundation、CryptoKit、Security 和 IOKit，不引入第三方网络或密码学库。当前首发支持 macOS。
+| Mode | Local verification |
+| --- | --- |
+| `opaque` | Restores a saved server response matched to the device's credentials. No independently signed license payload is available. |
+| `signed` | Also verifies a signed license token using the Ed25519 public key bundled with your app. |
+
+Both modes use an activation ID and device fingerprint for online license checks. Device trials use a trial ID and the device fingerprint. The SDK stores license and trial credentials in Keychain.
+
+## Integration notes
+
+- **Restore before checking.** Await `restoreLocalEntitlement()` before starting online validation at launch. `currentSnapshot`, a failure's `lastKnownValue`, or `.notPerformed`'s cached value cannot replace this initial verification.
+- **Choose the right trigger.** Use `.silent` for background checks, such as at launch, on returning to the foreground, or when connectivity returns. Use `.userInitiated` for an explicit user action. Both have a 30-second minimum between new validation requests, including attempts that fail. The product's configured check interval applies only to silent calls; the SDK can check earlier after expiry, a build change, or an invalid signed token.
+- **Handle skipped checks quietly.** `.notPerformed` sends no request. For `.minimumInterval`, a user-initiated check can show the remaining wait time. `.productInterval` usually needs no message. The SDK does not automatically retry when either interval ends. Activation, trial claims, and deactivation are not subject to these validation intervals.
+- **Separate connection problems from license status.** Expiry, suspension, and revocation are license states. A failed request is a check that could not be completed. Exceeding the offline grace period produces an `offlineGraceExceeded` freshness value; it does not by itself disable an otherwise valid license.
+- **Keep diagnostics free of secrets.** Use `businessCode`, sanitized `details`, and `OperationMetadata.requestID` for troubleshooting. Do not log license keys or signed license tokens.
+
+## Documentation
+
+The detailed guides below are currently in Simplified Chinese:
+
+- [API reference](./docs/API_REFERENCE.md)
+- [Architecture and security](./docs/ARCHITECTURE.md)
+- [Server integration guide](https://github.com/LicenKit/licenkit/blob/main/docs/zh-CN/unified-client-validation-guide.md)
+
+See the [changelog](./CHANGELOG.md) for version history and [LICENSE](./LICENSE) for license terms.
